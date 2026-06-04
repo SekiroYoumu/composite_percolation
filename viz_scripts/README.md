@@ -79,20 +79,30 @@ PFDT 看起来可能都接近线性变化。机制分析更应该看 flux 在 SE
 conda install -c conda-forge pyvista vtk
 ```
 
-然后可以渲染类似“中间剖开一个长方体”的 SE-only 3D cutaway：
+然后可以渲染类似“中间剖开一个长方体”的 SE-only 3D cutaway。默认会同时生成
+whole ROI 和 30 um representative 图：
 
 ```bash
-python viz_scripts/03_pyvista_whole_roi_cutaway.py --quantity potential
-python viz_scripts/03_pyvista_whole_roi_cutaway.py --quantity flux_magnitude
+python viz_scripts/03_pyvista_whole_roi_cutaway.py
 ```
 
-`flux_magnitude` 默认显示 `log2(flux / global SE median)`，其中 0 表示全局 SE
-中位通量，-1 表示 0.5 倍中位通量，+1 表示 2 倍中位通量；脚本还会默认把高通量
-SE 区域叠加为红色通道，用来突出 flux localization。
+也可以只渲染其中一类数据或一个物理量：
+
+```bash
+python viz_scripts/03_pyvista_whole_roi_cutaway.py --dataset whole_roi --quantity flux_magnitude
+python viz_scripts/03_pyvista_whole_roi_cutaway.py --dataset representative30 --quantity abs_Jy
+```
+
+`flux_magnitude` 和 `abs_Jy` 默认显示相对通量，即 `flux / global SE median`。
+色标范围默认为 0-2，其中 1 表示全局 SE 中位通量；脚本还会默认把
+`> 2x median` 的高通量 SE 区域叠加为红色通道，用来突出 flux localization。
+whole ROI 数据只保存了 `flux_magnitude`，30 um representative 数据保存了完整的
+`flux` vector，因此 30 um 会额外输出沿传输方向的 `abs_Jy` 3D map。
 
 默认输出：
 
 - `viz/whole_roi_3d_cutaway`
+- `viz/representative30_3d_cutaway`
 
 ## Whole ROI 通量不均匀性指标
 

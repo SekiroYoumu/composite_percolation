@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -10,59 +11,65 @@ import tifffile as tiff
 
 SAMPLES = ("WM", "PFDT")
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_OPACITY = 0.55
+DEFAULT_OPACITY = 0.52
+FLUX_QUANTITIES = {"flux_magnitude", "abs_Jy"}
+
+
+@dataclass(frozen=True)
+class DatasetSpec:
+    name: str
+    output_prefix: str
+    output_dir: Path
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Render whole-ROI 3D cutaway views with PyVista. "
-            "The default view colors the SE phase by potential or flux magnitude and clips the block open."
+            "Render SE-only 3D cutaway views with PyVista for whole ROI and 30 um representative fields."
         )
     )
     parser.add_argument("--project-root", default=PROJECT_ROOT)
     parser.add_argument("--whole-roi-root", default=PROJECT_ROOT / "server_results" / "whole_roi")
-    parser.add_argument("--output-dir", default=PROJECT_ROOT / "viz" / "whole_roi_3d_cutaway")
-    parser.add_argument("--quantity", choices=["potential", "flux_magnitude"], default="potential")
     parser.add_argument(
-        "--flux-display",
-        choices=["raw", "relative", "log2_relative"],
-        default="log2_relative",
+        "--representative-root",
+        default=PROJECT_ROOT / "server_results" / "30um-in-plane" / "results",
+    )
+    parser.add_argument(
+        "--dataset",
+        choices=["whole_roi", "representative30", "all"],
+        default="all",
+        help="Dataset to render. The default writes both whole ROI and 30 um representative cutaways.",
+    )
+    parser.add_argument(
+        "--quantity",
+        choices=["potential", "flux_magnitude", "abs_Jy", "all"],
+        default="all",
+        help="Scalar quantity to render. all expands to the quantities available for each dataset.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        default=None,
         help=(
-            "Display transform for flux_magnitude. log2_relative maps 0.5x/1x/2x "
-            "global SE median flux to -1/0/+1, matching the heterogeneity analysis."
+            "Optional output override. Use with a single --dataset. "
+            "For --dataset all, use --whole-roi-output-dir and --representative30-output-dir."
         ),
     )
+    parser.add_argument("--whole-roi-output-dir", default=PROJECT_ROOT / "viz" / "whole_roi_3d_cutaway")
     parser.add_argument(
-        "--flux-log2-limit",
-        type=float,
-        default=1.0,
-        help="Symmetric color limit for log2_relative flux display. The default highlights <0.5x and >2x median flux.",
-    )
-    parser.add_argument(
-        "--highlight-high-flux",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Overlay high-flux SE regions as opaque red channels when using log2_relative flux display.",
-    )
-    parser.add_argument(
-        "--highlight-flux-mode",
-        choices=["top_percentile", "median_2x"],
-        default="top_percentile",
-        help="High-flux overlay threshold: sample percentile cutoff, or flux > 2x global SE median.",
-    )
-    parser.add_argument(
-        "--highlight-flux-percentile",
-        type=float,
-        default=95.0,
-        help="Percentile cutoff for the high-flux overlay when --highlight-flux-mode=top_percentile.",
+        "--representative30-output-dir",
+        default=PROJECT_ROOT / "viz" / "representative30_3d_cutaway",
     )
     parser.add_argument("--se-label", type=int, default=2)
     parser.add_argument("--se-threshold", type=float, default=0.5)
     parser.add_argument("--voxel-size-um", type=float, default=0.07)
     parser.add_argument("--downsample-factor", type=int, default=None)
-    parser.add_argument("--crop-fraction", type=float, default=1.0, help="Center crop fraction for faster draft rendering.")
+    parser.add_argument("--representative-downsample-factor", type=int, default=2)
+    parser.add_argument("--crop-fraction", type=float, default=1.0, help="Center crop fraction for draft rendering.")
     parser.add_argument("--opacity", type=float, default=DEFAULT_OPACITY)
+    parser.add_argument("--flux-relative-limit", type=float, default=2.0)
+    parser.add_argument("--potential-percentile-low", type=float, default=1.0)
+    parser.add_argument("--potential-percentile-high", type=float, default=99.0)
+    parser.add_argument("--highlight-high-flux", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--window-width", type=int, default=2200)
     parser.add_argument("--window-height", type=int, default=1200)
     return parser.parse_args()
@@ -87,21 +94,6 @@ def read_json(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def load_fields(root: Path, sample: str) -> tuple[dict[str, np.ndarray], dict]:
-    field_dir = root / "bulk_fields" / sample / "fields" / "whole_roi"
-    npz_path = field_dir / "whole_roi_downsampled_fields.npz"
-    if not npz_path.exists():
-        raise FileNotFoundError(npz_path)
-    meta = read_json(field_dir / "metadata.json")
-    with np.load(npz_path) as data:
-        potential_key = "concentration" if "concentration" in data.files else "potential"
-        fields = {
-            "potential": np.asarray(data[potential_key], dtype=np.float32),
-            "flux_magnitude": np.asarray(data["flux_magnitude"], dtype=np.float32),
-        }
-    return fields, meta
-
-
 def label_path(project_root: Path, sample: str) -> Path:
     candidates = [
         project_root / "intermediate" / "labels" / sample / "label_zyx.tif",
@@ -113,8 +105,56 @@ def label_path(project_root: Path, sample: str) -> Path:
     raise FileNotFoundError(f"Could not find label_zyx.tif for {sample}")
 
 
-def downsample_se_fraction(label_zyx: np.ndarray, se_label: int, factor: int,
-                           target_shape: tuple[int, int, int]) -> np.ndarray:
+def crop_label_to_metadata(label_zyx: np.ndarray, meta: dict) -> np.ndarray:
+    coords = meta.get("coordinates")
+    if not coords:
+        return label_zyx
+    return label_zyx[
+        int(coords["z0"]): int(coords["z1"]),
+        int(coords["y0"]): int(coords["y1"]),
+        int(coords["x0"]): int(coords["x1"]),
+    ]
+
+
+def common_crop(*arrays: np.ndarray) -> list[np.ndarray]:
+    common = tuple(min(array.shape[i] for array in arrays) for i in range(3))
+    slicer = tuple(slice(0, n) for n in common)
+    return [array[slicer] for array in arrays]
+
+
+def center_crop(array: np.ndarray, fraction: float) -> np.ndarray:
+    if fraction >= 0.999:
+        return array
+    slices = []
+    for dim in array.shape:
+        n = max(8, int(round(dim * fraction)))
+        start = (dim - n) // 2
+        slices.append(slice(start, start + n))
+    return array[tuple(slices)]
+
+
+def block_mean(array: np.ndarray, factor: int) -> np.ndarray:
+    if factor <= 1:
+        return array.astype(np.float32, copy=False)
+    crop_shape = tuple((dim // factor) * factor for dim in array.shape)
+    cropped = array[tuple(slice(0, n) for n in crop_shape)].astype(np.float32, copy=False)
+    reshaped = cropped.reshape(
+        crop_shape[0] // factor,
+        factor,
+        crop_shape[1] // factor,
+        factor,
+        crop_shape[2] // factor,
+        factor,
+    )
+    return reshaped.mean(axis=(1, 3, 5), dtype=np.float32)
+
+
+def downsample_se_fraction(
+    label_zyx: np.ndarray,
+    se_label: int,
+    factor: int,
+    target_shape: tuple[int, int, int],
+) -> np.ndarray:
     label_xyz = np.transpose(label_zyx, (2, 1, 0))
     se = label_xyz == se_label
     if factor <= 1:
@@ -136,48 +176,104 @@ def downsample_se_fraction(label_zyx: np.ndarray, se_label: int, factor: int,
     return fraction[tuple(slice(0, n) for n in common)]
 
 
-def center_crop(array: np.ndarray, fraction: float) -> np.ndarray:
-    if fraction >= 0.999:
-        return array
-    slices = []
-    for dim in array.shape:
-        n = max(8, int(round(dim * fraction)))
-        start = (dim - n) // 2
-        slices.append(slice(start, start + n))
-    return array[tuple(slices)]
-
-
 def finite_se_values(scalar: np.ndarray, se_fraction: np.ndarray, se_threshold: float) -> np.ndarray:
     values = scalar[(se_fraction >= se_threshold) & np.isfinite(scalar)]
     return values.astype(np.float32, copy=False)
 
 
-def display_scalar(raw_scalar: np.ndarray, quantity: str, flux_display: str,
-                   global_flux_median: float | None) -> tuple[np.ndarray, str, str, tuple[float, float]]:
-    if quantity != "flux_magnitude":
-        return raw_scalar, "potential / concentration", "viridis", (1.0, 99.0)
+def load_whole_roi_entry(args: argparse.Namespace, sample: str, quantity: str) -> dict:
+    field_dir = Path(args.whole_roi_root) / "bulk_fields" / sample / "fields" / "whole_roi"
+    npz_path = field_dir / "whole_roi_downsampled_fields.npz"
+    if not npz_path.exists():
+        raise FileNotFoundError(npz_path)
+    meta = read_json(field_dir / "metadata.json")
+    with np.load(npz_path) as data:
+        potential_key = "concentration" if "concentration" in data.files else "potential"
+        key = potential_key if quantity == "potential" else quantity
+        scalar = np.asarray(data[key], dtype=np.float32)
 
-    if flux_display == "raw":
-        return raw_scalar, "flux magnitude", "inferno", (5.0, 99.0)
+    downsample = args.downsample_factor or int(meta.get("downsample_factor", 2))
+    se_fraction = downsample_se_fraction(
+        tiff.imread(label_path(Path(args.project_root), sample)),
+        args.se_label,
+        downsample,
+        scalar.shape,
+    )
+    scalar, se_fraction = common_crop(scalar, se_fraction)
+    scalar = center_crop(scalar, args.crop_fraction)
+    se_fraction = center_crop(se_fraction, args.crop_fraction)
+    scalar, se_fraction = common_crop(scalar, se_fraction)
+    return {
+        "sample": sample,
+        "scalar": scalar,
+        "se_fraction": se_fraction,
+        "spacing_um": float(args.voxel_size_um) * downsample,
+        "downsample": downsample,
+    }
 
-    if global_flux_median is None or not np.isfinite(global_flux_median) or global_flux_median <= 0:
-        raise ValueError("Cannot make relative flux display because the global SE flux median is not positive.")
 
-    relative = raw_scalar / global_flux_median
-    if flux_display == "relative":
-        return relative.astype(np.float32, copy=False), "flux / global SE median", "turbo", (5.0, 99.0)
+def load_representative30_entry(args: argparse.Namespace, sample: str, quantity: str) -> dict:
+    field_dir = Path(args.representative_root) / sample / "representative_flux"
+    npz_path = field_dir / "median_representative_fields.npz"
+    if not npz_path.exists():
+        raise FileNotFoundError(npz_path)
+    meta = read_json(field_dir / "metadata.json")
+    with np.load(npz_path) as data:
+        if quantity == "potential":
+            potential_key = "concentration" if "concentration" in data.files else "potential"
+            scalar = np.asarray(data[potential_key], dtype=np.float32)
+        elif quantity == "flux_magnitude":
+            scalar = np.asarray(data["flux_magnitude"], dtype=np.float32)
+        else:
+            scalar = np.abs(np.asarray(data["flux"][..., 1], dtype=np.float32))
 
-    log_relative = np.full(raw_scalar.shape, np.nan, dtype=np.float32)
-    positive = relative > 0
-    log_relative[positive] = np.log2(relative[positive]).astype(np.float32, copy=False)
-    return log_relative, "log2 flux / median", "coolwarm", (2.0, 98.0)
+    label_zyx = tiff.imread(label_path(Path(args.project_root), sample))
+    label_xyz = np.transpose(crop_label_to_metadata(label_zyx, meta), (2, 1, 0))
+    se_fraction = (label_xyz == args.se_label).astype(np.float32, copy=False)
+    scalar, se_fraction = common_crop(scalar, se_fraction)
+    scalar = center_crop(scalar, args.crop_fraction)
+    se_fraction = center_crop(se_fraction, args.crop_fraction)
+    scalar, se_fraction = common_crop(scalar, se_fraction)
+
+    factor = int(args.downsample_factor or args.representative_downsample_factor)
+    scalar = block_mean(scalar, factor)
+    se_fraction = block_mean(se_fraction, factor)
+    scalar, se_fraction = common_crop(scalar, se_fraction)
+    return {
+        "sample": sample,
+        "scalar": scalar,
+        "se_fraction": se_fraction,
+        "spacing_um": float(args.voxel_size_um) * factor,
+        "downsample": factor,
+    }
+
+
+def display_entries(entries: list[dict], quantity: str, args: argparse.Namespace) -> tuple[str, str, tuple[float, float]]:
+    if quantity == "potential":
+        values = np.concatenate(
+            [finite_se_values(entry["scalar"], entry["se_fraction"], args.se_threshold) for entry in entries]
+        )
+        clim = tuple(float(v) for v in np.nanpercentile(values, [args.potential_percentile_low,
+                                                                 args.potential_percentile_high]))
+        return "potential", "viridis", clim
+
+    raw_values = [
+        finite_se_values(entry["scalar"], entry["se_fraction"], args.se_threshold)
+        for entry in entries
+    ]
+    raw_values = [values[values > 0] for values in raw_values if values.size]
+    median = float(np.nanmedian(np.concatenate(raw_values)))
+    label = "abs(J) / median" if quantity == "flux_magnitude" else "abs(Jy) / median"
+    for entry in entries:
+        entry["scalar"] = (entry["scalar"] / median).astype(np.float32, copy=False)
+        if args.highlight_high_flux:
+            entry["highlight_threshold"] = float(args.flux_relative_limit)
+    print(f"Global SE median for {label}: {median:.6g}")
+    return label, "coolwarm", (0.0, float(args.flux_relative_limit))
 
 
 def make_grid(pv, scalar: np.ndarray, se_fraction: np.ndarray, spacing_um: float):
-    common = tuple(min(scalar.shape[i], se_fraction.shape[i]) for i in range(3))
-    slicer = tuple(slice(0, n) for n in common)
-    scalar = scalar[slicer]
-    se_fraction = se_fraction[slicer]
+    scalar, se_fraction = common_crop(scalar, se_fraction)
     grid = pv.ImageData()
     grid.dimensions = scalar.shape
     grid.spacing = (spacing_um, spacing_um, spacing_um)
@@ -186,9 +282,19 @@ def make_grid(pv, scalar: np.ndarray, se_fraction: np.ndarray, spacing_um: float
     return grid
 
 
-def add_cutaway_mesh(plotter, pv, grid, title: str, scalar_label: str, cmap: str, se_threshold: float,
-                     clim: tuple[float, float], opacity: float, show_scalar_bar: bool,
-                     high_flux_threshold: float | None = None) -> None:
+def add_cutaway_mesh(
+    plotter,
+    pv,
+    grid,
+    title: str,
+    scalar_label: str,
+    cmap: str,
+    se_threshold: float,
+    clim: tuple[float, float],
+    opacity: float,
+    show_scalar_bar: bool,
+    high_flux_threshold: float | None = None,
+) -> tuple[float, float, float, float, float, float]:
     se_grid = grid.threshold(value=se_threshold, scalars="se_fraction")
     bounds = se_grid.bounds
     lx = bounds[1] - bounds[0]
@@ -199,8 +305,8 @@ def add_cutaway_mesh(plotter, pv, grid, title: str, scalar_label: str, cmap: str
         bounds[1],
         bounds[2] + 0.42 * ly,
         bounds[3],
-        bounds[4],
-        bounds[4] + 0.72 * lz,
+        bounds[4] + 0.42 * lz,
+        bounds[5],
     )
     cut = se_grid.clip_box(clip_bounds, invert=True)
     plotter.add_mesh(
@@ -212,14 +318,14 @@ def add_cutaway_mesh(plotter, pv, grid, title: str, scalar_label: str, cmap: str
         show_scalar_bar=show_scalar_bar,
         scalar_bar_args={
             "title": scalar_label,
-            "n_labels": 5,
+            "n_labels": 3,
             "fmt": "%.2f",
-            "title_font_size": 12,
-            "label_font_size": 11,
-            "position_x": 0.88,
-            "position_y": 0.25,
-            "width": 0.03,
-            "height": 0.48,
+            "title_font_size": 16,
+            "label_font_size": 14,
+            "position_x": 0.885,
+            "position_y": 0.22,
+            "width": 0.045,
+            "height": 0.42,
         } if show_scalar_bar else None,
         smooth_shading=False,
     )
@@ -229,123 +335,133 @@ def add_cutaway_mesh(plotter, pv, grid, title: str, scalar_label: str, cmap: str
             plotter.add_mesh(
                 high_flux,
                 color="#d73027",
-                opacity=0.92,
+                opacity=0.82,
                 show_scalar_bar=False,
                 smooth_shading=False,
             )
     outline = pv.Box(bounds=bounds).outline()
-    plotter.add_mesh(outline, color="black", line_width=1.0)
-    plotter.add_axes(line_width=2, labels_off=False)
-    plotter.add_text(title, font_size=14)
+    plotter.add_mesh(outline, color="black", line_width=0.9)
+    plotter.add_axes(line_width=1, labels_off=False)
+    plotter.add_text(title, position=(0.03, 0.93), font_size=10, viewport=True)
+    return bounds
 
 
-def main() -> None:
-    args = parse_args()
-    pv = require_pyvista()
-    pv.OFF_SCREEN = True
+def set_y_up_camera(plotter, bounds: tuple[float, float, float, float, float, float]) -> None:
+    center = np.array(
+        [
+            0.5 * (bounds[0] + bounds[1]),
+            0.5 * (bounds[2] + bounds[3]),
+            0.5 * (bounds[4] + bounds[5]),
+        ],
+        dtype=np.float64,
+    )
+    span = np.array([bounds[1] - bounds[0], bounds[3] - bounds[2], bounds[5] - bounds[4]], dtype=np.float64)
+    distance = float(np.linalg.norm(span) * 2.15)
+    direction = np.array([1.0, -0.14, 1.0], dtype=np.float64)
+    direction /= np.linalg.norm(direction)
+    plotter.camera.position = tuple(center + distance * direction)
+    plotter.camera.focal_point = tuple(center)
+    plotter.camera.view_up = (0.0, 1.0, 0.0)
+    plotter.camera.zoom(0.98)
 
-    project_root = Path(args.project_root)
-    whole_roi_root = Path(args.whole_roi_root)
-    out_dir = Path(args.output_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
 
-    entries = []
-    raw_flux_for_median = []
-    for sample in SAMPLES:
-        fields, meta = load_fields(whole_roi_root, sample)
-        downsample = args.downsample_factor or int(meta.get("downsample_factor", 2))
-        scalar = center_crop(fields[args.quantity], args.crop_fraction)
-        full_se = downsample_se_fraction(
-            tiff.imread(label_path(project_root, sample)),
-            args.se_label,
-            downsample,
-            fields[args.quantity].shape,
-        )
-        se_fraction = center_crop(full_se, args.crop_fraction)
-        common = tuple(min(scalar.shape[i], se_fraction.shape[i]) for i in range(3))
-        scalar = scalar[tuple(slice(0, n) for n in common)]
-        se_fraction = se_fraction[tuple(slice(0, n) for n in common)]
-        entries.append(
-            {
-                "sample": sample,
-                "raw_scalar": scalar,
-                "se_fraction": se_fraction,
-                "downsample": downsample,
-            }
-        )
-        vals = finite_se_values(scalar, se_fraction, args.se_threshold)
-        if args.quantity == "flux_magnitude":
-            vals = vals[vals > 0]
-            if vals.size:
-                raw_flux_for_median.append(vals)
-        print(f"{sample}: scalar={scalar.shape}, se_fraction={se_fraction.shape}, downsample={downsample}")
+def dataset_specs(args: argparse.Namespace) -> list[DatasetSpec]:
+    whole_dir = Path(args.output_dir) if args.output_dir and args.dataset == "whole_roi" else Path(args.whole_roi_output_dir)
+    rep_dir = (
+        Path(args.output_dir)
+        if args.output_dir and args.dataset == "representative30"
+        else Path(args.representative30_output_dir)
+    )
+    specs = {
+        "whole_roi": DatasetSpec("whole_roi", "whole_roi_3d_cutaway", whole_dir),
+        "representative30": DatasetSpec("representative30", "representative30_3d_cutaway", rep_dir),
+    }
+    if args.dataset == "all":
+        return [specs["whole_roi"], specs["representative30"]]
+    return [specs[args.dataset]]
 
-    global_flux_median = None
-    if args.quantity == "flux_magnitude":
-        global_flux_median = float(np.nanmedian(np.concatenate(raw_flux_for_median)))
-        print(f"Global SE flux median: {global_flux_median:.6g}")
 
-    values_for_clim = []
+def quantities_for_dataset(dataset: str, requested: str) -> list[str]:
+    available = {
+        "whole_roi": ["potential", "flux_magnitude"],
+        "representative30": ["potential", "flux_magnitude", "abs_Jy"],
+    }[dataset]
+    if requested == "all":
+        return available
+    if requested not in available:
+        raise ValueError(f"{requested} is not available for {dataset}. Available quantities: {', '.join(available)}")
+    return [requested]
+
+
+def load_entries(args: argparse.Namespace, dataset: str, quantity: str) -> list[dict]:
+    loader = load_whole_roi_entry if dataset == "whole_roi" else load_representative30_entry
+    entries = [loader(args, sample, quantity) for sample in SAMPLES]
     for entry in entries:
-        scalar, scalar_label, cmap, percentiles = display_scalar(
-            entry["raw_scalar"],
-            args.quantity,
-            args.flux_display,
-            global_flux_median,
+        print(
+            f"{dataset} {entry['sample']} {quantity}: "
+            f"scalar={entry['scalar'].shape}, se_fraction={entry['se_fraction'].shape}, "
+            f"downsample={entry['downsample']}, spacing={entry['spacing_um']:.3g} um"
         )
-        entry["scalar"] = scalar
-        entry["scalar_label"] = scalar_label
-        entry["cmap"] = cmap
-        vals = finite_se_values(scalar, entry["se_fraction"], args.se_threshold)
-        if vals.size:
-            values_for_clim.append(vals)
-        if (
-            args.quantity == "flux_magnitude"
-            and args.flux_display == "log2_relative"
-            and args.highlight_high_flux
-            and vals.size
-        ):
-            if args.highlight_flux_mode == "top_percentile":
-                entry["highlight_threshold"] = float(np.nanpercentile(vals, args.highlight_flux_percentile))
-            else:
-                entry["highlight_threshold"] = float(args.flux_log2_limit)
+    return entries
 
-    merged = np.concatenate(values_for_clim)
-    clim = tuple(float(v) for v in np.nanpercentile(merged, percentiles))
-    if args.quantity == "flux_magnitude" and args.flux_display == "log2_relative":
-        limit = float(args.flux_log2_limit)
-        clim = (-limit, limit)
-    print(f"Shared color limits for {entries[0]['scalar_label']}: {clim}")
 
+def render_cutaway(args: argparse.Namespace, pv, spec: DatasetSpec, quantity: str) -> Path:
+    entries = load_entries(args, spec.name, quantity)
+    scalar_label, cmap, clim = display_entries(entries, quantity, args)
+    print(f"Shared color limits for {spec.name} {scalar_label}: {clim}")
+
+    spec.output_dir.mkdir(parents=True, exist_ok=True)
     plotter = pv.Plotter(shape=(1, len(entries)), off_screen=True, window_size=(args.window_width, args.window_height))
+    plotter.set_background("white")
+    first_bounds = None
     for col, entry in enumerate(entries):
         plotter.subplot(0, col)
-        spacing = args.voxel_size_um * entry["downsample"]
         opacity = args.opacity
-        if args.quantity == "flux_magnitude" and args.opacity == DEFAULT_OPACITY:
-            opacity = 0.46
-        grid = make_grid(pv, entry["scalar"], entry["se_fraction"], spacing)
-        add_cutaway_mesh(
+        if quantity in FLUX_QUANTITIES and args.opacity == DEFAULT_OPACITY:
+            opacity = 0.38
+        grid = make_grid(pv, entry["scalar"], entry["se_fraction"], entry["spacing_um"])
+        quantity_title = "potential" if quantity == "potential" else scalar_label
+        bounds = add_cutaway_mesh(
             plotter,
             pv,
             grid,
-            f"{entry['sample']} SE-only {entry['scalar_label']}",
-            entry["scalar_label"],
-            entry["cmap"],
+            f"{entry['sample']} SE-only {quantity_title}",
+            scalar_label,
+            cmap,
             args.se_threshold,
             clim,
             opacity,
             show_scalar_bar=(col == len(entries) - 1),
             high_flux_threshold=entry.get("highlight_threshold"),
         )
-        plotter.camera_position = "iso"
-        plotter.camera.zoom(1.15)
+        set_y_up_camera(plotter, bounds)
+        if first_bounds is None:
+            first_bounds = bounds
 
     plotter.link_views()
-    out_path = out_dir / f"whole_roi_3d_cutaway_se_{args.quantity}.png"
-    plotter.screenshot(str(out_path))
+    if first_bounds is not None:
+        set_y_up_camera(plotter, first_bounds)
+    out_path = spec.output_dir / f"{spec.output_prefix}_se_{quantity}.png"
+    plotter.screenshot(str(out_path), transparent_background=True)
     plotter.close()
     print(f"Saved {out_path}")
+    return out_path
+
+
+def main() -> None:
+    args = parse_args()
+    if args.output_dir and args.dataset == "all":
+        raise ValueError("--output-dir is ambiguous with --dataset all; use dataset-specific output dir options.")
+    pv = require_pyvista()
+    pv.OFF_SCREEN = True
+
+    rendered = []
+    for spec in dataset_specs(args):
+        for quantity in quantities_for_dataset(spec.name, args.quantity):
+            rendered.append(render_cutaway(args, pv, spec, quantity))
+    print("\nRendered 3D cutaway files:")
+    for path in rendered:
+        print(f"- {path}")
 
 
 if __name__ == "__main__":
