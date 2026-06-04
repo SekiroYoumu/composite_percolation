@@ -82,6 +82,10 @@ python viz_scripts/03_pyvista_whole_roi_cutaway.py --quantity potential
 python viz_scripts/03_pyvista_whole_roi_cutaway.py --quantity flux_magnitude
 ```
 
+`flux_magnitude` 默认显示 `log2(flux / global SE median)`，其中 0 表示全局 SE
+中位通量，-1 表示 0.5 倍中位通量，+1 表示 2 倍中位通量；脚本还会默认把高通量
+SE 区域叠加为红色通道，用来突出 flux localization。
+
 默认输出：
 
 - `viz/whole_roi_3d_cutaway`

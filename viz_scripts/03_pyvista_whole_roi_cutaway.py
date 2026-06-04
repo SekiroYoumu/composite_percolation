@@ -10,6 +10,7 @@ import tifffile as tiff
 
 SAMPLES = ("WM", "PFDT")
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_OPACITY = 0.55
 
 
 def parse_args() -> argparse.Namespace:
@@ -23,12 +24,45 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--whole-roi-root", default=PROJECT_ROOT / "server_results" / "whole_roi")
     parser.add_argument("--output-dir", default=PROJECT_ROOT / "viz" / "whole_roi_3d_cutaway")
     parser.add_argument("--quantity", choices=["potential", "flux_magnitude"], default="potential")
+    parser.add_argument(
+        "--flux-display",
+        choices=["raw", "relative", "log2_relative"],
+        default="log2_relative",
+        help=(
+            "Display transform for flux_magnitude. log2_relative maps 0.5x/1x/2x "
+            "global SE median flux to -1/0/+1, matching the heterogeneity analysis."
+        ),
+    )
+    parser.add_argument(
+        "--flux-log2-limit",
+        type=float,
+        default=1.0,
+        help="Symmetric color limit for log2_relative flux display. The default highlights <0.5x and >2x median flux.",
+    )
+    parser.add_argument(
+        "--highlight-high-flux",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Overlay high-flux SE regions as opaque red channels when using log2_relative flux display.",
+    )
+    parser.add_argument(
+        "--highlight-flux-mode",
+        choices=["top_percentile", "median_2x"],
+        default="top_percentile",
+        help="High-flux overlay threshold: sample percentile cutoff, or flux > 2x global SE median.",
+    )
+    parser.add_argument(
+        "--highlight-flux-percentile",
+        type=float,
+        default=95.0,
+        help="Percentile cutoff for the high-flux overlay when --highlight-flux-mode=top_percentile.",
+    )
     parser.add_argument("--se-label", type=int, default=2)
     parser.add_argument("--se-threshold", type=float, default=0.5)
     parser.add_argument("--voxel-size-um", type=float, default=0.07)
     parser.add_argument("--downsample-factor", type=int, default=None)
     parser.add_argument("--crop-fraction", type=float, default=1.0, help="Center crop fraction for faster draft rendering.")
-    parser.add_argument("--opacity", type=float, default=0.55)
+    parser.add_argument("--opacity", type=float, default=DEFAULT_OPACITY)
     parser.add_argument("--window-width", type=int, default=2200)
     parser.add_argument("--window-height", type=int, default=1200)
     return parser.parse_args()
@@ -113,6 +147,32 @@ def center_crop(array: np.ndarray, fraction: float) -> np.ndarray:
     return array[tuple(slices)]
 
 
+def finite_se_values(scalar: np.ndarray, se_fraction: np.ndarray, se_threshold: float) -> np.ndarray:
+    values = scalar[(se_fraction >= se_threshold) & np.isfinite(scalar)]
+    return values.astype(np.float32, copy=False)
+
+
+def display_scalar(raw_scalar: np.ndarray, quantity: str, flux_display: str,
+                   global_flux_median: float | None) -> tuple[np.ndarray, str, str, tuple[float, float]]:
+    if quantity != "flux_magnitude":
+        return raw_scalar, "potential / concentration", "viridis", (1.0, 99.0)
+
+    if flux_display == "raw":
+        return raw_scalar, "flux magnitude", "inferno", (5.0, 99.0)
+
+    if global_flux_median is None or not np.isfinite(global_flux_median) or global_flux_median <= 0:
+        raise ValueError("Cannot make relative flux display because the global SE flux median is not positive.")
+
+    relative = raw_scalar / global_flux_median
+    if flux_display == "relative":
+        return relative.astype(np.float32, copy=False), "flux / global SE median", "turbo", (5.0, 99.0)
+
+    log_relative = np.full(raw_scalar.shape, np.nan, dtype=np.float32)
+    positive = relative > 0
+    log_relative[positive] = np.log2(relative[positive]).astype(np.float32, copy=False)
+    return log_relative, "log2 flux / median", "coolwarm", (2.0, 98.0)
+
+
 def make_grid(pv, scalar: np.ndarray, se_fraction: np.ndarray, spacing_um: float):
     common = tuple(min(scalar.shape[i], se_fraction.shape[i]) for i in range(3))
     slicer = tuple(slice(0, n) for n in common)
@@ -126,8 +186,9 @@ def make_grid(pv, scalar: np.ndarray, se_fraction: np.ndarray, spacing_um: float
     return grid
 
 
-def add_cutaway_mesh(plotter, pv, grid, title: str, quantity: str, se_threshold: float,
-                     clim: tuple[float, float], opacity: float) -> None:
+def add_cutaway_mesh(plotter, pv, grid, title: str, scalar_label: str, cmap: str, se_threshold: float,
+                     clim: tuple[float, float], opacity: float, show_scalar_bar: bool,
+                     high_flux_threshold: float | None = None) -> None:
     se_grid = grid.threshold(value=se_threshold, scalars="se_fraction")
     bounds = se_grid.bounds
     lx = bounds[1] - bounds[0]
@@ -141,16 +202,37 @@ def add_cutaway_mesh(plotter, pv, grid, title: str, quantity: str, se_threshold:
         bounds[4],
         bounds[4] + 0.72 * lz,
     )
-    cut = se_grid.clip_box(clip_bounds, invert=False)
+    cut = se_grid.clip_box(clip_bounds, invert=True)
     plotter.add_mesh(
         cut,
         scalars="value",
-        cmap="viridis" if quantity == "potential" else "magma",
+        cmap=cmap,
         clim=clim,
         opacity=opacity,
-        show_scalar_bar=False,
+        show_scalar_bar=show_scalar_bar,
+        scalar_bar_args={
+            "title": scalar_label,
+            "n_labels": 5,
+            "fmt": "%.2f",
+            "title_font_size": 12,
+            "label_font_size": 11,
+            "position_x": 0.88,
+            "position_y": 0.25,
+            "width": 0.03,
+            "height": 0.48,
+        } if show_scalar_bar else None,
         smooth_shading=False,
     )
+    if high_flux_threshold is not None:
+        high_flux = cut.threshold(value=high_flux_threshold, scalars="value")
+        if high_flux.n_points:
+            plotter.add_mesh(
+                high_flux,
+                color="#d73027",
+                opacity=0.92,
+                show_scalar_bar=False,
+                smooth_shading=False,
+            )
     outline = pv.Box(bounds=bounds).outline()
     plotter.add_mesh(outline, color="black", line_width=1.0)
     plotter.add_axes(line_width=2, labels_off=False)
@@ -168,7 +250,7 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     entries = []
-    values_for_clim = []
+    raw_flux_for_median = []
     for sample in SAMPLES:
         fields, meta = load_fields(whole_roi_root, sample)
         downsample = args.downsample_factor or int(meta.get("downsample_factor", 2))
@@ -183,32 +265,83 @@ def main() -> None:
         common = tuple(min(scalar.shape[i], se_fraction.shape[i]) for i in range(3))
         scalar = scalar[tuple(slice(0, n) for n in common)]
         se_fraction = se_fraction[tuple(slice(0, n) for n in common)]
-        entries.append((sample, scalar, se_fraction, downsample))
-        vals = scalar[se_fraction >= args.se_threshold]
-        vals = vals[np.isfinite(vals)]
-        if vals.size:
-            values_for_clim.append(vals.astype(np.float32, copy=False))
+        entries.append(
+            {
+                "sample": sample,
+                "raw_scalar": scalar,
+                "se_fraction": se_fraction,
+                "downsample": downsample,
+            }
+        )
+        vals = finite_se_values(scalar, se_fraction, args.se_threshold)
+        if args.quantity == "flux_magnitude":
+            vals = vals[vals > 0]
+            if vals.size:
+                raw_flux_for_median.append(vals)
         print(f"{sample}: scalar={scalar.shape}, se_fraction={se_fraction.shape}, downsample={downsample}")
 
-    merged = np.concatenate(values_for_clim)
+    global_flux_median = None
     if args.quantity == "flux_magnitude":
-        clim = tuple(float(v) for v in np.nanpercentile(merged, [5, 99]))
-    else:
-        clim = tuple(float(v) for v in np.nanpercentile(merged, [1, 99]))
-    print(f"Shared color limits for {args.quantity}: {clim}")
+        global_flux_median = float(np.nanmedian(np.concatenate(raw_flux_for_median)))
+        print(f"Global SE flux median: {global_flux_median:.6g}")
+
+    values_for_clim = []
+    for entry in entries:
+        scalar, scalar_label, cmap, percentiles = display_scalar(
+            entry["raw_scalar"],
+            args.quantity,
+            args.flux_display,
+            global_flux_median,
+        )
+        entry["scalar"] = scalar
+        entry["scalar_label"] = scalar_label
+        entry["cmap"] = cmap
+        vals = finite_se_values(scalar, entry["se_fraction"], args.se_threshold)
+        if vals.size:
+            values_for_clim.append(vals)
+        if (
+            args.quantity == "flux_magnitude"
+            and args.flux_display == "log2_relative"
+            and args.highlight_high_flux
+            and vals.size
+        ):
+            if args.highlight_flux_mode == "top_percentile":
+                entry["highlight_threshold"] = float(np.nanpercentile(vals, args.highlight_flux_percentile))
+            else:
+                entry["highlight_threshold"] = float(args.flux_log2_limit)
+
+    merged = np.concatenate(values_for_clim)
+    clim = tuple(float(v) for v in np.nanpercentile(merged, percentiles))
+    if args.quantity == "flux_magnitude" and args.flux_display == "log2_relative":
+        limit = float(args.flux_log2_limit)
+        clim = (-limit, limit)
+    print(f"Shared color limits for {entries[0]['scalar_label']}: {clim}")
 
     plotter = pv.Plotter(shape=(1, len(entries)), off_screen=True, window_size=(args.window_width, args.window_height))
-    for col, (sample, scalar, se_fraction, downsample) in enumerate(entries):
+    for col, entry in enumerate(entries):
         plotter.subplot(0, col)
-        spacing = args.voxel_size_um * downsample
-        grid = make_grid(pv, scalar, se_fraction, spacing)
-        add_cutaway_mesh(plotter, pv, grid, f"{sample} SE-only {args.quantity}", args.quantity,
-                         args.se_threshold, clim, args.opacity)
+        spacing = args.voxel_size_um * entry["downsample"]
+        opacity = args.opacity
+        if args.quantity == "flux_magnitude" and args.opacity == DEFAULT_OPACITY:
+            opacity = 0.46
+        grid = make_grid(pv, entry["scalar"], entry["se_fraction"], spacing)
+        add_cutaway_mesh(
+            plotter,
+            pv,
+            grid,
+            f"{entry['sample']} SE-only {entry['scalar_label']}",
+            entry["scalar_label"],
+            entry["cmap"],
+            args.se_threshold,
+            clim,
+            opacity,
+            show_scalar_bar=(col == len(entries) - 1),
+            high_flux_threshold=entry.get("highlight_threshold"),
+        )
         plotter.camera_position = "iso"
         plotter.camera.zoom(1.15)
 
     plotter.link_views()
-    plotter.add_scalar_bar(title=args.quantity, n_labels=5, position_x=0.88, position_y=0.25, height=0.5)
     out_path = out_dir / f"whole_roi_3d_cutaway_se_{args.quantity}.png"
     plotter.screenshot(str(out_path))
     plotter.close()
