@@ -205,6 +205,10 @@ python scripts/07_plot_representative_orthogonal_slices.py --config config.json
 - `results/figures/representative_potential_orthogonal_slices.png`
 - `results/figures/representative_flux_magnitude_orthogonal_slices_linear.png`
 - `results/figures/representative_flux_magnitude_orthogonal_slices_log.png`
+- `results/figures/representative_potential_flux_comparison.png`
+- `results/figures/representative_potential_flux_comparison_xy_center_z.png`
+- `results/figures/representative_potential_flux_comparison_xz_center_y.png`
+- `results/figures/representative_potential_flux_comparison_yz_center_x.png`
 - `results/figures/summary.csv`
 
 散点图每个点对应一个 sub-volume，并显示 mean +/- SD。这里的 SD 描述同一个 ROI 内 sub-volume 的空间变异，不应当写成完全独立样品重复。
