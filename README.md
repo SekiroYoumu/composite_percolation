@@ -190,12 +190,21 @@ bash run_whole_roi_server.sh
 python scripts/05_plot_results.py --config config.json
 ```
 
+如果已经保存了 median-representative field，并想补画 `xy/xz/yz` 三个正交截面：
+
+```bash
+python scripts/07_plot_representative_orthogonal_slices.py --config config.json
+```
+
 输出：
 
 - `results/figures/keff_norm_scatter.png`
 - `results/figures/phase_fraction_scatter.png`
 - `results/figures/flux_magnitude_linear.png`
 - `results/figures/flux_magnitude_log.png`
+- `results/figures/representative_potential_orthogonal_slices.png`
+- `results/figures/representative_flux_magnitude_orthogonal_slices_linear.png`
+- `results/figures/representative_flux_magnitude_orthogonal_slices_log.png`
 - `results/figures/summary.csv`
 
 散点图每个点对应一个 sub-volume，并显示 mean +/- SD。这里的 SD 描述同一个 ROI 内 sub-volume 的空间变异，不应当写成完全独立样品重复。
