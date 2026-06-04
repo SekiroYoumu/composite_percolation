@@ -4,6 +4,7 @@ __pycache__/
 
 logs/
 results/
+viz/
 input/
 server_results/
 archive/
