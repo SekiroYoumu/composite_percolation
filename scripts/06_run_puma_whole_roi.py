@@ -201,14 +201,23 @@ def run_one_sample(cfg: dict, sample_key: str, force: bool = False) -> dict:
     return row
 
 
+def write_available_whole_roi_summary(cfg: dict) -> None:
+    rows = []
+    for sample_key in cfg["samples"]:
+        path = sample_results_dir(cfg, sample_key) / "whole_roi_transport.csv"
+        if path.exists():
+            rows.append(pd.read_csv(path).iloc[0].to_dict())
+    if rows:
+        write_rows_csv(Path(cfg["_root"]) / cfg.get("results_dir", "results") / "whole_roi_transport.csv", rows)
+
+
 def main() -> int:
     args = parse_args()
     cfg = load_config(args.config)
     sample_keys = [args.sample] if args.sample else list(cfg["samples"].keys())
-    rows = []
     for sample_key in sample_keys:
-        rows.append(run_one_sample(cfg, sample_key, force=args.force))
-    write_rows_csv(Path(cfg["_root"]) / cfg.get("results_dir", "results") / "whole_roi_transport.csv", rows)
+        run_one_sample(cfg, sample_key, force=args.force)
+    write_available_whole_roi_summary(cfg)
     return 0
 
 
