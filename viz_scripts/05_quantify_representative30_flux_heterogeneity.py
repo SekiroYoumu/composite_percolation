@@ -14,6 +14,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import tifffile as tiff
 
+from viz_style import apply_publication_style, panel_figsize, save_figure, style_axes
+
 
 SAMPLES = ("WM", "PFDT")
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -23,7 +25,21 @@ PLANE_AXES = {
     "xz_center_y": ("x", "z"),
     "yz_center_x": ("y", "z"),
 }
+PLANE_LABELS = {
+    "xy_center_z": "xy, center z",
+    "xz_center_y": "xz, center y",
+    "yz_center_x": "yz, center x",
+}
 AXIS_INDEX = {"x": 0, "y": 1, "z": 2}
+QUANTITY_LABELS = {
+    "flux_magnitude": "|J|",
+    "abs_Jx": "|Jx|",
+    "abs_Jy": "|Jy|",
+    "abs_Jz": "|Jz|",
+}
+
+
+apply_publication_style()
 
 
 def parse_args() -> argparse.Namespace:
@@ -280,33 +296,38 @@ def save_metric_bars(rows: list[dict], out_dir: Path) -> None:
     metrics = [
         ("cv", "CV"),
         ("gini", "Gini"),
-        ("top_10pct_flux_share", "top 10% share"),
-        ("localization_index_1_minus_participation", "1 - participation"),
-        ("bottleneck_index_y_interior", "interior y bottleneck"),
+        ("top_10pct_flux_share", "top 10%\nshare"),
+        ("localization_index_1_minus_participation", "1 -\nparticipation"),
+        ("bottleneck_index_y_interior", "interior y\nbottleneck"),
     ]
     quantities = sorted({str(row["quantity"]) for row in rows})
     for quantity in quantities:
+        quantity_label = QUANTITY_LABELS.get(quantity, quantity)
         qrows = [row for row in rows if row["quantity"] == quantity]
         x = np.arange(len(metrics), dtype=np.float32)
         width = 0.34
-        fig, ax = plt.subplots(figsize=(10.8, 5.0), constrained_layout=True)
+        fig, ax = plt.subplots(
+            figsize=panel_figsize(1, 1, panel_width_mm=98.0, extra_width_mm=20.0),
+            constrained_layout=True,
+        )
         for i, row in enumerate(qrows):
             vals = [float(row[key]) for key, _ in metrics]
             ax.bar(x + (i - 0.5) * width, vals, width=width, label=row["sample"])
         ax.set_xticks(x)
         ax.set_xticklabels([label for _, label in metrics], rotation=20, ha="right")
-        ax.set_ylabel("heterogeneity / localization metric")
-        ax.set_title(f"30 um representative SE-only {quantity} heterogeneity")
-        ax.legend()
-        ax.grid(axis="y", alpha=0.25)
+        ax.set_ylabel("Metric value")
+        ax.set_title(f"30 um {quantity_label} heterogeneity")
+        ax.legend(loc="upper left", bbox_to_anchor=(1.01, 1.0), borderaxespad=0.0)
+        style_axes(ax, x_major=False)
         path = out_dir / f"representative30_{quantity}_heterogeneity_metrics.png"
-        fig.savefig(path, dpi=220)
+        save_figure(fig, path)
         plt.close(fig)
         print(f"Saved {path}")
 
 
 def save_lorenz(entries: list[dict], out_dir: Path, quantity: str) -> None:
-    fig, ax = plt.subplots(figsize=(6.4, 5.6), constrained_layout=True)
+    quantity_label = QUANTITY_LABELS.get(quantity, quantity)
+    fig, ax = plt.subplots(figsize=panel_figsize(1, 1), constrained_layout=True)
     for entry in entries:
         scalar = entry["quantities"][quantity]
         vals = scalar[np.isfinite(scalar) & entry["se_mask"]].astype(np.float64, copy=False)
@@ -318,20 +339,21 @@ def save_lorenz(entries: list[dict], out_dir: Path, quantity: str) -> None:
         cum_voxels = np.linspace(0.0, 1.0, cum_flux.size)
         ax.plot(cum_voxels, cum_flux, lw=2.4, label=entry["sample"])
     ax.plot([0, 1], [0, 1], color="0.6", lw=1.2, ls="--", label="uniform")
-    ax.set_xlabel("cumulative fraction of SE voxels, sorted by flux")
-    ax.set_ylabel("cumulative fraction of total SE flux")
-    ax.set_title(f"30 um representative Lorenz curve: {quantity}")
+    ax.set_xlabel("SE voxel fraction")
+    ax.set_ylabel("Flux fraction")
+    ax.set_title(f"30 um Lorenz: {quantity_label}")
     ax.legend(loc="upper left")
-    ax.grid(alpha=0.25)
+    style_axes(ax)
     path = out_dir / f"representative30_{quantity}_lorenz_curve.png"
-    fig.savefig(path, dpi=220)
+    save_figure(fig, path)
     plt.close(fig)
     print(f"Saved {path}")
 
 
 def save_y_profiles(entries: list[dict], out_dir: Path, quantity: str, voxel_um: float,
                     margin_fraction: float) -> None:
-    fig, axes = plt.subplots(1, 2, figsize=(12.0, 4.8), constrained_layout=True)
+    quantity_label = QUANTITY_LABELS.get(quantity, quantity)
+    fig, axes = plt.subplots(1, 2, figsize=panel_figsize(2, 1), constrained_layout=True)
     for entry in entries:
         profile = plane_profile(entry["quantities"][quantity], entry["se_mask"])
         y = np.arange(profile["mean"].size, dtype=np.float32) * voxel_um
@@ -344,16 +366,16 @@ def save_y_profiles(entries: list[dict], out_dir: Path, quantity: str, voxel_um:
         ax.axhline(1.0, color="0.5", lw=1.0, ls="--")
         ax.axvspan(0, margin_fraction * y[-1], color="0.8", alpha=0.2, lw=0)
         ax.axvspan((1.0 - margin_fraction) * y[-1], y[-1], color="0.8", alpha=0.2, lw=0)
-        ax.legend()
-        ax.grid(alpha=0.25)
-    axes[0].set_xlabel("y (um), transport direction")
-    axes[0].set_ylabel("plane mean / interior median")
-    axes[0].set_title(f"30 um representative plane mean: {quantity}")
-    axes[1].set_xlabel("y (um), transport direction")
-    axes[1].set_ylabel("plane total / interior median")
-    axes[1].set_title(f"30 um representative plane total: {quantity}")
+        ax.legend(loc="upper right")
+        style_axes(ax)
+    axes[0].set_xlabel("y (um)")
+    axes[0].set_ylabel("Mean / interior median")
+    axes[0].set_title(f"Plane mean: {quantity_label}")
+    axes[1].set_xlabel("y (um)")
+    axes[1].set_ylabel("Total / interior median")
+    axes[1].set_title(f"Plane total: {quantity_label}")
     path = out_dir / f"representative30_{quantity}_bottleneck_y_profiles.png"
-    fig.savefig(path, dpi=220)
+    save_figure(fig, path)
     plt.close(fig)
     print(f"Saved {path}")
 
@@ -380,8 +402,10 @@ def image_extent_um(image: np.ndarray, plane: str, voxel_um: float) -> tuple[flo
 
 def save_low_high_maps(entries: list[dict], out_dir: Path, quantity: str, voxel_um: float,
                        global_median: float) -> None:
+    quantity_label = QUANTITY_LABELS.get(quantity, quantity)
     for plane in PLANES:
-        fig, axes = plt.subplots(1, len(entries), figsize=(6.1 * len(entries), 5.4), constrained_layout=False)
+        fig, axes = plt.subplots(1, len(entries), figsize=panel_figsize(len(entries), 1, extra_width_mm=24.0),
+                                 constrained_layout=False)
         fig.subplots_adjust(left=0.07, right=0.82, bottom=0.12, top=0.86, wspace=0.28)
         if len(entries) == 1:
             axes = [axes]
@@ -407,7 +431,7 @@ def save_low_high_maps(entries: list[dict], out_dir: Path, quantity: str, voxel_
             axis_h, axis_v = PLANE_AXES[plane]
             ax.set_xlabel(f"{axis_h} (um)")
             ax.set_ylabel(f"{axis_v} (um)")
-            ax.set_title(f"{entry['sample']} {plane}\n30 um {quantity} localization")
+            ax.set_title(f"{entry['sample']} {PLANE_LABELS[plane]}\n{quantity_label} localization")
         handles = [
             plt.Line2D([0], [0], color="#4575b4", lw=8, label="< 0.5x global median"),
             plt.Line2D([0], [0], color=(0.64, 0.64, 0.64), lw=8, label="SE background"),
@@ -417,7 +441,8 @@ def save_low_high_maps(entries: list[dict], out_dir: Path, quantity: str, voxel_
         ]
         fig.legend(handles=handles, loc="center left", bbox_to_anchor=(0.84, 0.50), frameon=False)
         path = out_dir / f"representative30_{quantity}_low_high_map_{plane}.png"
-        fig.savefig(path, dpi=220)
+        style_axes(axes)
+        save_figure(fig, path)
         plt.close(fig)
         print(f"Saved {path}")
 

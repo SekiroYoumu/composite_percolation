@@ -63,6 +63,10 @@ python viz_scripts/02_plot_whole_roi_se_flux_enhanced.py
 - SE-only flux 分布图和 CDF
 - 沿 y 方向的 plane-wise profile
 
+2D 图默认使用论文版式：Arial，tick label 9 pt，坐标轴标题 10 pt，单 panel
+轴框高度 53.97 mm，边框 0.9 pt，主刻度长度 3 pt，主刻度约 3-5 个，副刻度每个主刻度区间 1 个，
+无内部网格，透明背景。
+
 注意：potential / concentration 主要反映边界条件施加的宏观梯度，所以 WM 和
 PFDT 看起来可能都接近线性变化。机制分析更应该看 flux 在 SE 内部的分布、
 局域化和瓶颈，而不是只看 potential 颜色是否明显不同。
@@ -122,6 +126,12 @@ python viz_scripts/04_quantify_flux_heterogeneity.py
 
 ```bash
 python viz_scripts/05_quantify_representative30_flux_heterogeneity.py
+```
+
+如果需要生成和 whole-ROI SE-only 增强图同类型的 30 um representative 图，运行：
+
+```bash
+python viz_scripts/06_plot_representative30_se_flux_enhanced.py
 ```
 
 默认输入：

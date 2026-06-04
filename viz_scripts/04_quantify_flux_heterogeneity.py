@@ -13,6 +13,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import tifffile as tiff
 
+from viz_style import apply_publication_style, panel_figsize, save_figure, style_axes
+
 
 SAMPLES = ("WM", "PFDT")
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -22,6 +24,14 @@ PLANE_AXES = {
     "xz_center_y": ("x", "z"),
     "yz_center_x": ("y", "z"),
 }
+PLANE_LABELS = {
+    "xy_center_z": "xy, center z",
+    "xz_center_y": "xz, center y",
+    "yz_center_x": "yz, center x",
+}
+
+
+apply_publication_style()
 
 
 def parse_args() -> argparse.Namespace:
@@ -245,31 +255,34 @@ def save_bar_summary(rows: list[dict], out_dir: Path) -> None:
     metrics = [
         ("cv", "CV"),
         ("gini", "Gini"),
-        ("top_10pct_flux_share", "top 10% flux share"),
-        ("localization_index_1_minus_participation", "1 - participation ratio"),
-        ("bottleneck_index_y", "y bottleneck index"),
+        ("top_10pct_flux_share", "top 10%\nshare"),
+        ("localization_index_1_minus_participation", "1 -\nparticipation"),
+        ("bottleneck_index_y", "y\nbottleneck"),
     ]
     samples = [row["sample"] for row in rows]
     x = np.arange(len(metrics), dtype=np.float32)
     width = 0.34
-    fig, ax = plt.subplots(figsize=(10.5, 5.0), constrained_layout=True)
+    fig, ax = plt.subplots(
+        figsize=panel_figsize(1, 1, panel_width_mm=98.0, extra_width_mm=20.0),
+        constrained_layout=True,
+    )
     for i, row in enumerate(rows):
         vals = [float(row[key]) for key, _ in metrics]
         ax.bar(x + (i - 0.5) * width, vals, width=width, label=samples[i])
     ax.set_xticks(x)
     ax.set_xticklabels([label for _, label in metrics], rotation=20, ha="right")
-    ax.set_ylabel("heterogeneity / localization metric")
-    ax.set_title("SE-only flux heterogeneity metrics")
-    ax.legend(loc="upper left")
-    ax.grid(axis="y", alpha=0.25)
+    ax.set_ylabel("Metric value")
+    ax.set_title("Flux heterogeneity")
+    ax.legend(loc="upper left", bbox_to_anchor=(1.01, 1.0), borderaxespad=0.0)
+    style_axes(ax, x_major=False)
     path = out_dir / "whole_roi_flux_heterogeneity_metrics.png"
-    fig.savefig(path, dpi=220)
+    save_figure(fig, path)
     plt.close(fig)
     print(f"Saved {path}")
 
 
 def save_lorenz(entries: list[dict], out_dir: Path) -> None:
-    fig, ax = plt.subplots(figsize=(6.4, 5.6), constrained_layout=True)
+    fig, ax = plt.subplots(figsize=panel_figsize(1, 1), constrained_layout=True)
     for entry in entries:
         vals = np.sort(entry["values"].astype(np.float64, copy=False))
         total = vals.sum()
@@ -279,19 +292,19 @@ def save_lorenz(entries: list[dict], out_dir: Path) -> None:
         cum_voxels = np.linspace(0.0, 1.0, cum_flux.size)
         ax.plot(cum_voxels, cum_flux, lw=2.4, label=entry["sample"])
     ax.plot([0, 1], [0, 1], color="0.6", lw=1.2, ls="--", label="uniform")
-    ax.set_xlabel("cumulative fraction of SE voxels, sorted by flux")
-    ax.set_ylabel("cumulative fraction of total SE flux")
-    ax.set_title("Lorenz curve of SE-only flux localization")
-    ax.legend()
-    ax.grid(alpha=0.25)
+    ax.set_xlabel("SE voxel fraction")
+    ax.set_ylabel("Flux fraction")
+    ax.set_title("Lorenz curve")
+    ax.legend(loc="upper left")
+    style_axes(ax)
     path = out_dir / "whole_roi_flux_lorenz_curve.png"
-    fig.savefig(path, dpi=220)
+    save_figure(fig, path)
     plt.close(fig)
     print(f"Saved {path}")
 
 
 def save_y_profiles(entries: list[dict], out_dir: Path, voxel_um: float) -> None:
-    fig, axes = plt.subplots(1, 2, figsize=(12.0, 4.8), constrained_layout=True)
+    fig, axes = plt.subplots(1, 2, figsize=panel_figsize(2, 1), constrained_layout=True)
     for entry in entries:
         profile = plane_profile(entry)
         y = np.arange(profile["mean"].size, dtype=np.float32) * voxel_um
@@ -299,18 +312,18 @@ def save_y_profiles(entries: list[dict], out_dir: Path, voxel_um: float) -> None
         total = profile["total"]
         axes[0].plot(y, mean / np.nanmedian(mean), lw=2.2, label=entry["sample"])
         axes[1].plot(y, total / np.nanmedian(total), lw=2.2, label=entry["sample"])
-    axes[0].set_xlabel("y (um), transport direction")
-    axes[0].set_ylabel("plane mean flux / median")
-    axes[0].set_title("Relative plane-wise SE flux")
-    axes[1].set_xlabel("y (um), transport direction")
-    axes[1].set_ylabel("plane total flux / median")
-    axes[1].set_title("Relative plane-wise total SE flux")
+    axes[0].set_xlabel("y (um)")
+    axes[0].set_ylabel("Mean flux / median")
+    axes[0].set_title("Plane mean flux")
+    axes[1].set_xlabel("y (um)")
+    axes[1].set_ylabel("Total flux / median")
+    axes[1].set_title("Plane total flux")
     for ax in axes:
         ax.axhline(1.0, color="0.5", lw=1.0, ls="--")
-        ax.legend()
-        ax.grid(alpha=0.25)
+        ax.legend(loc="upper right")
+        style_axes(ax)
     path = out_dir / "whole_roi_flux_bottleneck_y_profiles.png"
-    fig.savefig(path, dpi=220)
+    save_figure(fig, path)
     plt.close(fig)
     print(f"Saved {path}")
 
@@ -337,7 +350,8 @@ def image_extent_um(image: np.ndarray, plane: str, voxel_um: float) -> tuple[flo
 
 def save_low_high_maps(entries: list[dict], out_dir: Path, voxel_um: float, global_median: float) -> None:
     for plane in PLANES:
-        fig, axes = plt.subplots(1, len(entries), figsize=(6.1 * len(entries), 5.4), constrained_layout=False)
+        fig, axes = plt.subplots(1, len(entries), figsize=panel_figsize(len(entries), 1, extra_width_mm=24.0),
+                                 constrained_layout=False)
         fig.subplots_adjust(left=0.07, right=0.82, bottom=0.12, top=0.86, wspace=0.28)
         if len(entries) == 1:
             axes = [axes]
@@ -362,7 +376,7 @@ def save_low_high_maps(entries: list[dict], out_dir: Path, voxel_um: float, glob
             axis_h, axis_v = PLANE_AXES[plane]
             ax.set_xlabel(f"{axis_h} (um)")
             ax.set_ylabel(f"{axis_v} (um)")
-            ax.set_title(f"{entry['sample']} {plane}\nunder-used SE and concentrated flux")
+            ax.set_title(f"{entry['sample']} {PLANE_LABELS[plane]}\nlow and high flux")
         handles = [
             plt.Line2D([0], [0], color="#4575b4", lw=8, label="< 0.5x global median"),
             plt.Line2D([0], [0], color=(0.64, 0.64, 0.64), lw=8, label="SE background"),
@@ -372,7 +386,8 @@ def save_low_high_maps(entries: list[dict], out_dir: Path, voxel_um: float, glob
         ]
         fig.legend(handles=handles, loc="center left", bbox_to_anchor=(0.84, 0.50), frameon=False)
         path = out_dir / f"whole_roi_flux_low_high_map_{plane}.png"
-        fig.savefig(path, dpi=220)
+        style_axes(axes)
+        save_figure(fig, path)
         plt.close(fig)
         print(f"Saved {path}")
 

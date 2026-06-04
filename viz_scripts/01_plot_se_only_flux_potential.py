@@ -28,6 +28,10 @@ from pipeline_common import (  # noqa: E402
     transpose_between_orders,
     voxel_size_by_axis,
 )
+from viz_style import apply_publication_style, panel_figsize, save_figure, style_axes, style_colorbar  # noqa: E402
+
+
+apply_publication_style()
 
 
 PLANES = ["xy_center_z", "xz_center_y", "yz_center_x"]
@@ -35,6 +39,11 @@ PLANE_AXES = {
     "xy_center_z": ("x", "y"),
     "xz_center_y": ("x", "z"),
     "yz_center_x": ("y", "z"),
+}
+PLANE_LABELS = {
+    "xy_center_z": "xy, center z",
+    "xz_center_y": "xz, center y",
+    "yz_center_x": "yz, center x",
 }
 
 
@@ -229,7 +238,7 @@ def save_comparison(entries: list[dict], cfg: dict, out: Path, se_threshold: flo
     flux_limits = display_limits(entries, "flux_magnitude", se_threshold, percentile_low, percentile_high)
     nrows = 2 * len(planes)
     ncols = len(entries)
-    fig, axes = plt.subplots(nrows, ncols, figsize=(5.1 * ncols, 3.9 * nrows), squeeze=False,
+    fig, axes = plt.subplots(nrows, ncols, figsize=panel_figsize(ncols, nrows), squeeze=False,
                              constrained_layout=True)
     cmaps = {
         "potential": transparent_cmap("viridis"),
@@ -244,8 +253,8 @@ def save_comparison(entries: list[dict], cfg: dict, out: Path, se_threshold: flo
             if entry["source"] == "whole_roi":
                 subtitle = "whole ROI"
             for row_offset, field, label, limits in [
-                (0, "potential", "SE-only potential / concentration", potential_limits),
-                (1, "flux_magnitude", "SE-only flux magnitude", flux_limits),
+                (0, "potential", "Potential / concentration", potential_limits),
+                (1, "flux_magnitude", "Flux magnitude", flux_limits),
             ]:
                 row = 2 * plane_index + row_offset
                 ax = axes[row, col]
@@ -265,12 +274,13 @@ def save_comparison(entries: list[dict], cfg: dict, out: Path, se_threshold: flo
                 ax.set_ylim(common_extent[2], common_extent[3])
                 ax.set_xlabel(f"{axis_h} (um)")
                 ax.set_ylabel(f"{axis_v} (um)")
-                ax.set_title(f"{entry['sample']} {subtitle}\n{plane_name} {label}")
+                ax.set_title(f"{entry['sample']} {subtitle}\n{PLANE_LABELS[plane_name]} {label}")
                 if col == ncols - 1:
-                    fig.colorbar(im, ax=ax, shrink=0.82, label=label)
+                    style_colorbar(fig.colorbar(im, ax=ax, shrink=0.82, label=label))
 
     out.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out, dpi=220, transparent=False)
+    style_axes(axes)
+    save_figure(fig, out)
     plt.close(fig)
 
 
