@@ -184,6 +184,19 @@ bash run_whole_roi_server.sh
 
 整块 ROI field 默认只保存 `potential/concentration` 和 `flux_magnitude`，使用 `whole_roi_downsample_factor` 做平均降采样，并按 `field_dtype` 转为 `float32`。
 
+整块 ROI downsampled field 的 WM/PFDT 对比拼图：
+
+```bash
+python scripts/08_plot_whole_roi_downsampled_comparison.py --config config.json
+```
+
+输出：
+
+- `results/figures/whole_roi_potential_flux_comparison.png`
+- `results/figures/whole_roi_potential_flux_comparison_xy_center_z.png`
+- `results/figures/whole_roi_potential_flux_comparison_xz_center_y.png`
+- `results/figures/whole_roi_potential_flux_comparison_yz_center_x.png`
+
 ## 作图
 
 ```bash
