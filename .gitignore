@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+logs/
+results/
+input/
+server_results/
+archive/
+bulk_fields/
+intermediate/
+config_representative_recompute.json
+check.py

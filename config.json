@@ -1,0 +1,63 @@
+{
+  "voxel_size_um": 0.07,
+  "tiff_axis_order": "z_y_x",
+  "puma_axis_order": "x_y_z",
+  "through_plane_axis": "y",
+  "side_bc": "symmetric",
+  "fill_unassigned_as_void": false,
+  "input_dir": "input",
+  "results_dir": "results",
+  "label_dir": "intermediate/labels",
+  "labels": {
+    "CAM": 1,
+    "SE-rich": 2,
+    "Void/carbon-rich": 3
+  },
+  "conductivity": {
+    "1": 1e-6,
+    "2": 1.0,
+    "3": 1e-6
+  },
+  "samples": {
+    "WM": {
+      "name": "WM-LPSCB",
+      "masks": {
+        "CAM": "wm-am.tiff",
+        "SE-rich": "wm-se.tiff",
+        "Void/carbon-rich": "wm-void.tiff"
+      }
+    },
+    "PFDT": {
+      "name": "PFDT@LPSCB",
+      "masks": {
+        "CAM": "pfdt-am.tiff",
+        "SE-rich": "pfdt-se.tiff",
+        "Void/carbon-rich": "pfdt-void.tiff"
+      }
+    }
+  },
+  "subvolume_um": [30.0, 30.0, 30.0],
+  "stride_um": null,
+  "sampling_mode": "edge_aligned",
+  "edge_aligned_counts": {
+    "x": 1,
+    "y": 2,
+    "z": 2
+  },
+  "field_output": "representative",
+  "representative_output": "auto",
+  "skip_completed": true,
+  "whole_roi_field_output": "downsampled",
+  "whole_roi_downsample_factor": 2,
+  "field_dtype": "float32",
+  "field_storage_dir": "bulk_fields/current",
+  "workers": 18,
+  "smoke_test_um": [5.0, 5.0, 5.0],
+  "smoke_test_voxels": null,
+  "solver": {
+    "solver_type": "cg",
+    "tolerance": 1e-5,
+    "maxiter": 10000,
+    "display_iter": false
+  }
+}

@@ -1,0 +1,14 @@
+name: fibsem-puma-transport
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python>=3.10
+  - puma
+  - numpy
+  - pandas
+  - scipy
+  - tifffile
+  - matplotlib
+  - scikit-image
+  - pip
