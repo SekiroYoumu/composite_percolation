@@ -72,6 +72,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--flux-relative-limit", type=float, default=2.0)
     parser.add_argument("--flux-tail-percent", type=float, default=5.0)
     parser.add_argument(
+        "--flux-map-mode",
+        choices=["tails", "high_only"],
+        default="tails",
+        help=(
+            "Flux rendering mode. tails shows the low/high tails; high_only hides the low tail "
+            "and emphasizes only high-flux bottleneck channels."
+        ),
+    )
+    parser.add_argument(
         "--flux-tail-scale",
         choices=["sample_median", "absolute"],
         default="sample_median",
@@ -293,23 +302,25 @@ def display_entries(entries: list[dict], quantity: str, args: argparse.Namespace
     median = float(np.nanmedian(merged))
     label = "abs(J)" if quantity == "flux_magnitude" else "abs(Jy)"
     scale_label = "sample-median scaled" if args.flux_tail_scale == "sample_median" else "absolute"
-    print(
-        f"Global SE {label} ({scale_label}): median={median:.6g}, "
-        f"bottom{low_percent:g}%<={low_threshold:.6g}, top{low_percent:g}%>={high_threshold:.6g}"
-    )
+    print(f"Global SE {label} ({scale_label}): median={median:.6g}, top{low_percent:g}%>={high_threshold:.6g}")
+    if args.flux_map_mode == "tails":
+        print(f"  bottom{low_percent:g}%<={low_threshold:.6g}")
     for entry in entries:
         sample_values = finite_se_values(entry["scalar"], entry["se_fraction"], args.se_threshold)
         sample_values = sample_values[np.isfinite(sample_values)]
         if sample_values.size:
             low_fraction = float(np.count_nonzero(sample_values <= low_threshold) / sample_values.size)
             high_fraction = float(np.count_nonzero(sample_values >= high_threshold) / sample_values.size)
-            print(
-                f"  {entry['sample']} tails: "
-                f"bottom{low_percent:g}% global={100 * low_fraction:.2f}%, "
-                f"top{low_percent:g}% global={100 * high_fraction:.2f}%"
-            )
+            if args.flux_map_mode == "tails":
+                print(
+                    f"  {entry['sample']} tails: "
+                    f"bottom{low_percent:g}% global={100 * low_fraction:.2f}%, "
+                    f"top{low_percent:g}% global={100 * high_fraction:.2f}%"
+                )
+            else:
+                print(f"  {entry['sample']} high tail: top{low_percent:g}% global={100 * high_fraction:.2f}%")
     return {
-        "mode": "tails",
+        "mode": args.flux_map_mode,
         "label": label,
         "low_threshold": low_threshold,
         "high_threshold": high_threshold,
@@ -446,6 +457,54 @@ def add_tail_cutaway_mesh(
     return bounds
 
 
+def add_high_only_cutaway_mesh(
+    plotter,
+    pv,
+    grid,
+    title: str,
+    se_threshold: float,
+    high_threshold: float,
+    tail_percent: float,
+    show_legend: bool,
+) -> tuple[float, float, float, float, float, float]:
+    cut, bounds = cutaway_grid(pv, grid, se_threshold)
+    plotter.add_mesh(
+        cut,
+        color=SE_BASE_COLOR,
+        opacity=0.50,
+        show_scalar_bar=False,
+        smooth_shading=False,
+        lighting=False,
+    )
+    high_flux = cut.threshold(value=high_threshold, scalars="value", method="upper", all_scalars=True)
+    if high_flux.n_points:
+        plotter.add_mesh(
+            high_flux,
+            color=HIGH_FLUX_COLOR,
+            opacity=0.98,
+            show_scalar_bar=False,
+            smooth_shading=False,
+            lighting=False,
+        )
+    outline = pv.Box(bounds=bounds).outline()
+    plotter.add_mesh(outline, color="black", line_width=0.9)
+    plotter.add_axes(line_width=1, labels_off=False)
+    plotter.add_text(title, position=(0.03, 0.93), font_size=10, viewport=True)
+    if show_legend:
+        plotter.add_legend(
+            labels=[
+                ["SE", SE_BASE_COLOR],
+                [f"top {tail_percent:.0f}%", HIGH_FLUX_COLOR],
+            ],
+            size=(0.12, 0.08),
+            loc="lower right",
+            bcolor="white",
+            border=False,
+            background_opacity=0.0,
+        )
+    return bounds
+
+
 def set_y_up_camera(plotter, bounds: tuple[float, float, float, float, float, float]) -> None:
     center = np.array(
         [
@@ -534,7 +593,7 @@ def render_cutaway(args: argparse.Namespace, pv, spec: DatasetSpec, quantity: st
                 opacity,
                 show_scalar_bar=(col == len(entries) - 1),
             )
-        else:
+        elif display["mode"] == "tails":
             bounds = add_tail_cutaway_mesh(
                 plotter,
                 pv,
@@ -546,6 +605,17 @@ def render_cutaway(args: argparse.Namespace, pv, spec: DatasetSpec, quantity: st
                 display["tail_percent"],
                 show_legend=(col == len(entries) - 1),
             )
+        else:
+            bounds = add_high_only_cutaway_mesh(
+                plotter,
+                pv,
+                grid,
+                f"{entry['sample']} SE-only {display['label']} high flux",
+                args.se_threshold,
+                display["high_threshold"],
+                display["tail_percent"],
+                show_legend=(col == len(entries) - 1),
+            )
         set_y_up_camera(plotter, bounds)
         if first_bounds is None:
             first_bounds = bounds
@@ -553,7 +623,8 @@ def render_cutaway(args: argparse.Namespace, pv, spec: DatasetSpec, quantity: st
     plotter.link_views()
     if first_bounds is not None:
         set_y_up_camera(plotter, first_bounds)
-    out_path = spec.output_dir / f"{spec.output_prefix}_se_{quantity}.png"
+    suffix = "_high_only" if display["mode"] == "high_only" else ""
+    out_path = spec.output_dir / f"{spec.output_prefix}_se_{quantity}{suffix}.png"
     plotter.screenshot(str(out_path), transparent_background=True)
     plotter.close()
     print(f"Saved {out_path}")

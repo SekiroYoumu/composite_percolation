@@ -98,6 +98,15 @@ python viz_scripts/03_pyvista_whole_roi_cutaway.py --dataset representative30 --
 区域显示为灰色，低利用区域显示为蓝色，高通量集中通道显示为红色。这个默认
 更适合表达 WM 中 flux 更局域化、PFDT 中极端低/高通量区域更少的机制图。
 如果需要严格绝对值阈值，可以加 `--flux-tail-scale absolute`。
+如果只想突出高通量 bottleneck、避免把 CAM 颗粒边界附近的低 flux 区域解释为
+低利用通道，可以加：
+
+```bash
+python viz_scripts/03_pyvista_whole_roi_cutaway.py --dataset representative30 --quantity abs_Jy --flux-map-mode high_only
+```
+
+high-only 模式只保留灰色 SE 背景和红色 top tail，并输出带 `_high_only` 后缀的 PNG，
+不会覆盖默认 tail map。
 whole ROI 数据只保存了 `flux_magnitude`，30 um representative 数据保存了完整的
 `flux` vector，因此 30 um 会额外输出沿传输方向的 `abs_Jy` 3D map。
 
