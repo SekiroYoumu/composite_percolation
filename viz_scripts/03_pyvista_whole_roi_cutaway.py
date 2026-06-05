@@ -13,6 +13,9 @@ SAMPLES = ("WM", "PFDT")
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_OPACITY = 0.52
 FLUX_QUANTITIES = {"flux_magnitude", "abs_Jy"}
+SE_BASE_COLOR = "#b0b0b0"
+LOW_FLUX_COLOR = "#4575b4"
+HIGH_FLUX_COLOR = "#d73027"
 
 
 @dataclass(frozen=True)
@@ -67,6 +70,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--crop-fraction", type=float, default=1.0, help="Center crop fraction for draft rendering.")
     parser.add_argument("--opacity", type=float, default=DEFAULT_OPACITY)
     parser.add_argument("--flux-relative-limit", type=float, default=2.0)
+    parser.add_argument("--flux-tail-percent", type=float, default=5.0)
+    parser.add_argument(
+        "--flux-tail-scale",
+        choices=["sample_median", "absolute"],
+        default="sample_median",
+        help=(
+            "Scale used before extracting low/high flux tails. sample_median emphasizes localization "
+            "within each sample; absolute uses one raw-value threshold for WM and PFDT."
+        ),
+    )
     parser.add_argument("--potential-percentile-low", type=float, default=1.0)
     parser.add_argument("--potential-percentile-high", type=float, default=99.0)
     parser.add_argument("--highlight-high-flux", action=argparse.BooleanOptionalAction, default=True)
@@ -248,28 +261,61 @@ def load_representative30_entry(args: argparse.Namespace, sample: str, quantity:
     }
 
 
-def display_entries(entries: list[dict], quantity: str, args: argparse.Namespace) -> tuple[str, str, tuple[float, float]]:
+def display_entries(entries: list[dict], quantity: str, args: argparse.Namespace) -> dict:
     if quantity == "potential":
         values = np.concatenate(
             [finite_se_values(entry["scalar"], entry["se_fraction"], args.se_threshold) for entry in entries]
         )
         clim = tuple(float(v) for v in np.nanpercentile(values, [args.potential_percentile_low,
                                                                  args.potential_percentile_high]))
-        return "potential", "viridis", clim
+        return {"mode": "continuous", "label": "potential", "cmap": "viridis", "clim": clim}
 
-    raw_values = [
-        finite_se_values(entry["scalar"], entry["se_fraction"], args.se_threshold)
-        for entry in entries
-    ]
-    raw_values = [values[values > 0] for values in raw_values if values.size]
-    median = float(np.nanmedian(np.concatenate(raw_values)))
-    label = "abs(J) / median" if quantity == "flux_magnitude" else "abs(Jy) / median"
+    scaled_values = []
     for entry in entries:
-        entry["scalar"] = (entry["scalar"] / median).astype(np.float32, copy=False)
-        if args.highlight_high_flux:
-            entry["highlight_threshold"] = float(args.flux_relative_limit)
-    print(f"Global SE median for {label}: {median:.6g}")
-    return label, "coolwarm", (0.0, float(args.flux_relative_limit))
+        values = finite_se_values(entry["scalar"], entry["se_fraction"], args.se_threshold)
+        values = values[np.isfinite(values) & (values > 0)]
+        if not values.size:
+            continue
+        if args.flux_tail_scale == "sample_median":
+            sample_median = float(np.nanmedian(values))
+            if sample_median <= 0 or not np.isfinite(sample_median):
+                raise ValueError(f"Cannot normalize {entry['sample']} {quantity}; SE median is not positive.")
+            entry["scalar"] = (entry["scalar"] / sample_median).astype(np.float32, copy=False)
+            scaled_values.append(values / sample_median)
+            entry["tail_scale_label"] = f"{entry['sample']} median={sample_median:.6g}"
+        else:
+            scaled_values.append(values)
+            entry["tail_scale_label"] = "absolute"
+    merged = np.concatenate(scaled_values)
+    low_percent = float(args.flux_tail_percent)
+    high_percent = 100.0 - low_percent
+    low_threshold, high_threshold = (float(v) for v in np.nanpercentile(merged, [low_percent, high_percent]))
+    median = float(np.nanmedian(merged))
+    label = "abs(J)" if quantity == "flux_magnitude" else "abs(Jy)"
+    scale_label = "sample-median scaled" if args.flux_tail_scale == "sample_median" else "absolute"
+    print(
+        f"Global SE {label} ({scale_label}): median={median:.6g}, "
+        f"bottom{low_percent:g}%<={low_threshold:.6g}, top{low_percent:g}%>={high_threshold:.6g}"
+    )
+    for entry in entries:
+        sample_values = finite_se_values(entry["scalar"], entry["se_fraction"], args.se_threshold)
+        sample_values = sample_values[np.isfinite(sample_values)]
+        if sample_values.size:
+            low_fraction = float(np.count_nonzero(sample_values <= low_threshold) / sample_values.size)
+            high_fraction = float(np.count_nonzero(sample_values >= high_threshold) / sample_values.size)
+            print(
+                f"  {entry['sample']} tails: "
+                f"bottom{low_percent:g}% global={100 * low_fraction:.2f}%, "
+                f"top{low_percent:g}% global={100 * high_fraction:.2f}%"
+            )
+    return {
+        "mode": "tails",
+        "label": label,
+        "low_threshold": low_threshold,
+        "high_threshold": high_threshold,
+        "tail_percent": low_percent,
+        "scale_label": scale_label,
+    }
 
 
 def make_grid(pv, scalar: np.ndarray, se_fraction: np.ndarray, spacing_um: float):
@@ -282,19 +328,7 @@ def make_grid(pv, scalar: np.ndarray, se_fraction: np.ndarray, spacing_um: float
     return grid
 
 
-def add_cutaway_mesh(
-    plotter,
-    pv,
-    grid,
-    title: str,
-    scalar_label: str,
-    cmap: str,
-    se_threshold: float,
-    clim: tuple[float, float],
-    opacity: float,
-    show_scalar_bar: bool,
-    high_flux_threshold: float | None = None,
-) -> tuple[float, float, float, float, float, float]:
+def cutaway_grid(pv, grid, se_threshold: float):
     se_grid = grid.threshold(value=se_threshold, scalars="se_fraction")
     bounds = se_grid.bounds
     lx = bounds[1] - bounds[0]
@@ -309,6 +343,22 @@ def add_cutaway_mesh(
         bounds[5],
     )
     cut = se_grid.clip_box(clip_bounds, invert=True)
+    return cut, bounds
+
+
+def add_continuous_cutaway_mesh(
+    plotter,
+    pv,
+    grid,
+    title: str,
+    scalar_label: str,
+    cmap: str,
+    se_threshold: float,
+    clim: tuple[float, float],
+    opacity: float,
+    show_scalar_bar: bool,
+) -> tuple[float, float, float, float, float, float]:
+    cut, bounds = cutaway_grid(pv, grid, se_threshold)
     plotter.add_mesh(
         cut,
         scalars="value",
@@ -329,20 +379,70 @@ def add_cutaway_mesh(
         } if show_scalar_bar else None,
         smooth_shading=False,
     )
-    if high_flux_threshold is not None:
-        high_flux = cut.threshold(value=high_flux_threshold, scalars="value")
-        if high_flux.n_points:
-            plotter.add_mesh(
-                high_flux,
-                color="#d73027",
-                opacity=0.82,
-                show_scalar_bar=False,
-                smooth_shading=False,
-            )
     outline = pv.Box(bounds=bounds).outline()
     plotter.add_mesh(outline, color="black", line_width=0.9)
     plotter.add_axes(line_width=1, labels_off=False)
     plotter.add_text(title, position=(0.03, 0.93), font_size=10, viewport=True)
+    return bounds
+
+
+def add_tail_cutaway_mesh(
+    plotter,
+    pv,
+    grid,
+    title: str,
+    se_threshold: float,
+    low_threshold: float,
+    high_threshold: float,
+    tail_percent: float,
+    show_legend: bool,
+) -> tuple[float, float, float, float, float, float]:
+    cut, bounds = cutaway_grid(pv, grid, se_threshold)
+    plotter.add_mesh(
+        cut,
+        color=SE_BASE_COLOR,
+        opacity=0.90,
+        show_scalar_bar=False,
+        smooth_shading=False,
+        lighting=False,
+    )
+    low_flux = cut.threshold(value=low_threshold, scalars="value", method="lower", all_scalars=True)
+    if low_flux.n_points:
+        plotter.add_mesh(
+            low_flux,
+            color=LOW_FLUX_COLOR,
+            opacity=0.75,
+            show_scalar_bar=False,
+            smooth_shading=False,
+            lighting=False,
+        )
+    high_flux = cut.threshold(value=high_threshold, scalars="value", method="upper", all_scalars=True)
+    if high_flux.n_points:
+        plotter.add_mesh(
+            high_flux,
+            color=HIGH_FLUX_COLOR,
+            opacity=0.75,
+            show_scalar_bar=False,
+            smooth_shading=False,
+            lighting=False,
+        )
+    outline = pv.Box(bounds=bounds).outline()
+    plotter.add_mesh(outline, color="black", line_width=0.9)
+    plotter.add_axes(line_width=1, labels_off=False)
+    plotter.add_text(title, position=(0.03, 0.93), font_size=10, viewport=True)
+    if show_legend:
+        plotter.add_legend(
+            labels=[
+                [f"middle {100 - 2 * tail_percent:.0f}%", SE_BASE_COLOR],
+                [f"low {tail_percent:.0f}%", LOW_FLUX_COLOR],
+                [f"high {tail_percent:.0f}%", HIGH_FLUX_COLOR],
+            ],
+            size=(0.18, 0.13),
+            loc="lower right",
+            bcolor="white",
+            border=False,
+            background_opacity=0.0,
+        )
     return bounds
 
 
@@ -356,8 +456,8 @@ def set_y_up_camera(plotter, bounds: tuple[float, float, float, float, float, fl
         dtype=np.float64,
     )
     span = np.array([bounds[1] - bounds[0], bounds[3] - bounds[2], bounds[5] - bounds[4]], dtype=np.float64)
-    distance = float(np.linalg.norm(span) * 2.15)
-    direction = np.array([1.0, -0.14, 1.0], dtype=np.float64)
+    distance = float(np.linalg.norm(span) * 2.25)
+    direction = np.array([1.0, 0.78, 1.0], dtype=np.float64)
     direction /= np.linalg.norm(direction)
     plotter.camera.position = tuple(center + distance * direction)
     plotter.camera.focal_point = tuple(center)
@@ -407,8 +507,9 @@ def load_entries(args: argparse.Namespace, dataset: str, quantity: str) -> list[
 
 def render_cutaway(args: argparse.Namespace, pv, spec: DatasetSpec, quantity: str) -> Path:
     entries = load_entries(args, spec.name, quantity)
-    scalar_label, cmap, clim = display_entries(entries, quantity, args)
-    print(f"Shared color limits for {spec.name} {scalar_label}: {clim}")
+    display = display_entries(entries, quantity, args)
+    if display["mode"] == "continuous":
+        print(f"Shared color limits for {spec.name} {display['label']}: {display['clim']}")
 
     spec.output_dir.mkdir(parents=True, exist_ok=True)
     plotter = pv.Plotter(shape=(1, len(entries)), off_screen=True, window_size=(args.window_width, args.window_height))
@@ -420,20 +521,31 @@ def render_cutaway(args: argparse.Namespace, pv, spec: DatasetSpec, quantity: st
         if quantity in FLUX_QUANTITIES and args.opacity == DEFAULT_OPACITY:
             opacity = 0.38
         grid = make_grid(pv, entry["scalar"], entry["se_fraction"], entry["spacing_um"])
-        quantity_title = "potential" if quantity == "potential" else scalar_label
-        bounds = add_cutaway_mesh(
-            plotter,
-            pv,
-            grid,
-            f"{entry['sample']} SE-only {quantity_title}",
-            scalar_label,
-            cmap,
-            args.se_threshold,
-            clim,
-            opacity,
-            show_scalar_bar=(col == len(entries) - 1),
-            high_flux_threshold=entry.get("highlight_threshold"),
-        )
+        if display["mode"] == "continuous":
+            bounds = add_continuous_cutaway_mesh(
+                plotter,
+                pv,
+                grid,
+                f"{entry['sample']} SE-only {display['label']}",
+                display["label"],
+                display["cmap"],
+                args.se_threshold,
+                display["clim"],
+                opacity,
+                show_scalar_bar=(col == len(entries) - 1),
+            )
+        else:
+            bounds = add_tail_cutaway_mesh(
+                plotter,
+                pv,
+                grid,
+                f"{entry['sample']} SE-only {display['label']} tails",
+                args.se_threshold,
+                display["low_threshold"],
+                display["high_threshold"],
+                display["tail_percent"],
+                show_legend=(col == len(entries) - 1),
+            )
         set_y_up_camera(plotter, bounds)
         if first_bounds is None:
             first_bounds = bounds

@@ -93,9 +93,11 @@ python viz_scripts/03_pyvista_whole_roi_cutaway.py --dataset whole_roi --quantit
 python viz_scripts/03_pyvista_whole_roi_cutaway.py --dataset representative30 --quantity abs_Jy
 ```
 
-`flux_magnitude` 和 `abs_Jy` 默认显示相对通量，即 `flux / global SE median`。
-色标范围默认为 0-2，其中 1 表示全局 SE 中位通量；脚本还会默认把
-`> 2x median` 的高通量 SE 区域叠加为红色通道，用来突出 flux localization。
+`flux_magnitude` 和 `abs_Jy` 默认显示 tail map：每个样品先按自身 SE median
+归一化，再用 WM+PFDT 合并后的阈值标出最低 5% 和最高 5%。中间 90% 的 SE
+区域显示为灰色，低利用区域显示为蓝色，高通量集中通道显示为红色。这个默认
+更适合表达 WM 中 flux 更局域化、PFDT 中极端低/高通量区域更少的机制图。
+如果需要严格绝对值阈值，可以加 `--flux-tail-scale absolute`。
 whole ROI 数据只保存了 `flux_magnitude`，30 um representative 数据保存了完整的
 `flux` vector，因此 30 um 会额外输出沿传输方向的 `abs_Jy` 3D map。
 
@@ -103,6 +105,16 @@ whole ROI 数据只保存了 `flux_magnitude`，30 um representative 数据保�
 
 - `viz/whole_roi_3d_cutaway`
 - `viz/representative30_3d_cutaway`
+
+AM-SE 和 AM-Void 接触邻接关系的 3D 示意图：
+
+```bash
+python viz_scripts/07_plot_contact_adjacency_3d.py
+```
+
+默认使用 30 um representative label block，输出到：
+
+- `viz/contact_adjacency_3d`
 
 ## Whole ROI 通量不均匀性指标
 
