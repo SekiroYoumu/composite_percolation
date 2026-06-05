@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
 import matplotlib
@@ -12,15 +13,28 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
+for parent in Path(__file__).resolve().parents:
+    viz_scripts_dir = parent / "viz_scripts"
+    if viz_scripts_dir.exists():
+        sys.path.insert(0, str(viz_scripts_dir))
+        break
 from pipeline_common import center_slice, figures_dir, load_config, sample_results_dir, write_rows_csv
+from viz_style import apply_publication_style, panel_figsize, save_figure, style_axes
 
 
 PHASES = ["CAM", "SE-rich", "Void/carbon-rich"]
+SAMPLE_COLORS = {"WM": "#376795", "PFDT": "#72bcd5"}
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Plot transport and phase-fraction summary figures.")
     parser.add_argument("--config", default="config.json")
+    parser.add_argument(
+        "--results-dir",
+        default=None,
+        help="Override cfg['results_dir']; useful for redrawing archived result folders.",
+    )
+    parser.add_argument("--scatter-only", action="store_true", help="Only redraw scatter summary figures.")
     return parser.parse_args()
 
 
@@ -38,42 +52,56 @@ def read_results(cfg: dict) -> pd.DataFrame:
 
 
 def scatter_with_mean_sd(df: pd.DataFrame, out: Path) -> None:
+    apply_publication_style()
     samples = list(df["sample"].drop_duplicates())
-    fig, ax = plt.subplots(figsize=(6.5, 5), constrained_layout=True)
+    fig, ax = plt.subplots(figsize=panel_figsize(panel_width_mm=62.0), constrained_layout=True)
     rng = np.random.default_rng(123)
     for i, sample in enumerate(samples, start=1):
         values = df.loc[df["sample"] == sample, "keff_norm"].to_numpy(float)
         x = np.full(values.size, i, dtype=float) + rng.uniform(-0.08, 0.08, size=values.size)
-        ax.scatter(x, values, s=42, alpha=0.85, label=sample)
+        color = SAMPLE_COLORS.get(sample, f"C{i - 1}")
+        ax.scatter(x, values, s=28, alpha=0.82, color=color, edgecolors="none", label=sample)
         mean = float(np.mean(values))
         sd = float(np.std(values, ddof=1)) if values.size > 1 else 0.0
-        ax.errorbar(i, mean, yerr=sd, fmt="o", ms=8, color="black", capsize=6, lw=1.5)
+        ax.errorbar(i, mean, yerr=sd, fmt="o", ms=4.5, color="black", capsize=3, lw=0.9)
     ax.set_xticks(range(1, len(samples) + 1), samples)
-    ax.set_ylabel("Normalized effective ionic transport coefficient")
+    ax.set_ylabel("Normalized effective ionic\ntransport coefficient")
     ax.set_xlabel("Sample")
-    ax.grid(axis="y", alpha=0.25)
-    fig.savefig(out, dpi=220)
+    ax.set_xlim(0.55, len(samples) + 0.45)
+    style_axes(ax, x_major=False)
+    ax.tick_params(axis="x", which="minor", bottom=False)
+    save_figure(fig, out)
     plt.close(fig)
 
 
 def phase_fraction_scatter(df: pd.DataFrame, out: Path) -> None:
+    apply_publication_style()
     samples = list(df["sample"].drop_duplicates())
-    fig, axes = plt.subplots(1, 3, figsize=(12, 4), constrained_layout=True, sharey=True)
+    fig, axes = plt.subplots(
+        1,
+        3,
+        figsize=panel_figsize(ncols=3, panel_width_mm=50.0),
+        constrained_layout=True,
+        sharey=True,
+    )
     rng = np.random.default_rng(456)
     for ax, phase in zip(axes, PHASES):
         col = f"{phase} fraction"
         for i, sample in enumerate(samples, start=1):
             values = df.loc[df["sample"] == sample, col].to_numpy(float)
             x = np.full(values.size, i, dtype=float) + rng.uniform(-0.08, 0.08, size=values.size)
-            ax.scatter(x, values, s=36, alpha=0.85)
+            color = SAMPLE_COLORS.get(sample, f"C{i - 1}")
+            ax.scatter(x, values, s=24, alpha=0.82, color=color, edgecolors="none")
             mean = float(np.mean(values))
             sd = float(np.std(values, ddof=1)) if values.size > 1 else 0.0
-            ax.errorbar(i, mean, yerr=sd, fmt="o", ms=7, color="black", capsize=5, lw=1.3)
+            ax.errorbar(i, mean, yerr=sd, fmt="o", ms=4.2, color="black", capsize=3, lw=0.9)
         ax.set_title(phase)
         ax.set_xticks(range(1, len(samples) + 1), samples)
-        ax.grid(axis="y", alpha=0.25)
+        ax.set_xlim(0.55, len(samples) + 0.45)
+        style_axes(ax, x_major=False, y_major=(ax is axes[0]))
+        ax.tick_params(axis="x", which="minor", bottom=False)
     axes[0].set_ylabel("Phase fraction")
-    fig.savefig(out, dpi=220)
+    save_figure(fig, out)
     plt.close(fig)
 
 
@@ -182,10 +210,15 @@ def write_summary(df: pd.DataFrame, out: Path) -> None:
 def main() -> int:
     args = parse_args()
     cfg = load_config(args.config)
+    if args.results_dir:
+        cfg["results_dir"] = args.results_dir
     fig_dir = figures_dir(cfg)
     df = read_results(cfg)
     scatter_with_mean_sd(df, fig_dir / "keff_norm_scatter.png")
     phase_fraction_scatter(df, fig_dir / "phase_fraction_scatter.png")
+    if args.scatter_only:
+        print(f"Saved scatter figures in {fig_dir}")
+        return 0
     representative_flux_maps(cfg, fig_dir / "flux_magnitude_linear.png", fig_dir / "flux_magnitude_log.png")
     representative_concentration_maps(cfg, fig_dir / "concentration_linear.png")
     write_summary(df, fig_dir / "summary.csv")
