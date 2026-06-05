@@ -107,6 +107,15 @@ python viz_scripts/03_pyvista_whole_roi_cutaway.py --dataset representative30 --
 
 high-only 模式只保留灰色 SE 背景和红色 top tail，并输出带 `_high_only` 后缀的 PNG，
 不会覆盖默认 tail map。
+如果希望把 WM 的 top 5% 阈值作为共同参考，再看 PFDT 有多少 SE 区域超过这个
+WM bottleneck 阈值，可以运行：
+
+```bash
+python viz_scripts/03_pyvista_whole_roi_cutaway.py --dataset representative30 --quantity abs_Jy --flux-map-mode high_only --flux-tail-reference wm
+python viz_scripts/03_pyvista_whole_roi_cutaway.py --dataset representative30 --quantity flux_magnitude --flux-map-mode high_only --flux-tail-reference wm
+```
+
+这会输出 `_wm_ref_high_only.png`，适合表达“PFDT 中达到 WM 高通量拥挤程度的区域更少”。
 potential 默认仍为 SE-only mask。如果需要显示 SE+AM 两相内的电势场，可以运行：
 
 ```bash
@@ -122,7 +131,39 @@ whole ROI 数据只保存了 `flux_magnitude`，30 um representative 数据保�
 - `viz/whole_roi_3d_cutaway`
 - `viz/representative30_3d_cutaway`
 
-AM-SE 和 AM-Void 接触邻接关系的 3D 示意图：
+## 几何结构 overview、contact map 和指标
+
+几何分析统一入口：
+
+```bash
+python viz_scripts/08_analyze_geometry_3d.py
+```
+
+这个脚本同时处理 30 um representative 和 whole ROI 的整数 label volume，输出：
+
+- 三相整体 overview 与 CAM / SE-rich / Void-carbon-rich 单相 3D cutaway
+- AM-SE 与 AM-Void contact map
+- phase fraction、AM-SE / AM-Void 界面面积、AM 表面接触比例、SE 连通性等几何指标
+
+默认输出：
+
+- `viz/geometry_3d/representative30_phase_overview_3d.png`
+- `viz/geometry_3d/representative30_am_contact_adjacency_3d.png`
+- `viz/geometry_3d/whole_roi_phase_overview_3d.png`
+- `viz/geometry_3d/whole_roi_am_contact_adjacency_3d.png`
+- `viz/geometry_metrics/geometry_metrics_summary.csv`
+- `viz/geometry_metrics/geometry_contact_metrics_summary.png`
+
+其中 AM 表面接触比例主要看：
+
+- `am_se_area_fraction_of_am_internal_surface`
+- `am_void_area_fraction_of_am_internal_surface`
+
+这两个指标用原始 label 的 6-neighbor 面接触计数计算，不受 3D 渲染降采样影响。
+默认 3D 渲染为了速度会降采样：30 um 用 4x，whole ROI 用 6x；如需更细可以调
+`--representative-render-downsample` 或 `--whole-roi-render-downsample`。
+
+旧的 AM-SE 和 AM-Void 接触邻接关系单图脚本仍可单独运行：
 
 ```bash
 python viz_scripts/07_plot_contact_adjacency_3d.py

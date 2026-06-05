@@ -96,6 +96,12 @@ def parse_args() -> argparse.Namespace:
             "within each sample; absolute uses one raw-value threshold for WM and PFDT."
         ),
     )
+    parser.add_argument(
+        "--flux-tail-reference",
+        choices=["merged", "wm", "pfdt"],
+        default="merged",
+        help="Reference distribution used to choose flux tail thresholds.",
+    )
     parser.add_argument("--potential-percentile-low", type=float, default=1.0)
     parser.add_argument("--potential-percentile-high", type=float, default=99.0)
     parser.add_argument("--highlight-high-flux", action=argparse.BooleanOptionalAction, default=True)
@@ -298,7 +304,7 @@ def display_entries(entries: list[dict], quantity: str, args: argparse.Namespace
                                                                  args.potential_percentile_high]))
         return {"mode": "continuous", "label": "potential", "cmap": "viridis", "clim": clim}
 
-    scaled_values = []
+    scaled_values = {}
     for entry in entries:
         values = finite_se_values(entry["scalar"], entry["se_fraction"], args.se_threshold)
         values = values[np.isfinite(values) & (values > 0)]
@@ -309,19 +315,24 @@ def display_entries(entries: list[dict], quantity: str, args: argparse.Namespace
             if sample_median <= 0 or not np.isfinite(sample_median):
                 raise ValueError(f"Cannot normalize {entry['sample']} {quantity}; SE median is not positive.")
             entry["scalar"] = (entry["scalar"] / sample_median).astype(np.float32, copy=False)
-            scaled_values.append(values / sample_median)
+            scaled_values[entry["sample"]] = values / sample_median
             entry["tail_scale_label"] = f"{entry['sample']} median={sample_median:.6g}"
         else:
-            scaled_values.append(values)
+            scaled_values[entry["sample"]] = values
             entry["tail_scale_label"] = "absolute"
-    merged = np.concatenate(scaled_values)
+    merged = np.concatenate(list(scaled_values.values()))
+    reference_name = args.flux_tail_reference.upper() if args.flux_tail_reference != "merged" else "merged"
+    reference_values = merged if args.flux_tail_reference == "merged" else scaled_values[reference_name]
     low_percent = float(args.flux_tail_percent)
     high_percent = 100.0 - low_percent
-    low_threshold, high_threshold = (float(v) for v in np.nanpercentile(merged, [low_percent, high_percent]))
+    low_threshold, high_threshold = (float(v) for v in np.nanpercentile(reference_values, [low_percent, high_percent]))
     median = float(np.nanmedian(merged))
     label = "abs(J)" if quantity == "flux_magnitude" else "abs(Jy)"
     scale_label = "sample-median scaled" if args.flux_tail_scale == "sample_median" else "absolute"
-    print(f"Global SE {label} ({scale_label}): median={median:.6g}, top{low_percent:g}%>={high_threshold:.6g}")
+    print(
+        f"Global SE {label} ({scale_label}, {reference_name} threshold): "
+        f"median={median:.6g}, top{low_percent:g}%>={high_threshold:.6g}"
+    )
     if args.flux_map_mode == "tails":
         print(f"  bottom{low_percent:g}%<={low_threshold:.6g}")
     for entry in entries:
@@ -345,6 +356,7 @@ def display_entries(entries: list[dict], quantity: str, args: argparse.Namespace
         "high_threshold": high_threshold,
         "tail_percent": low_percent,
         "scale_label": scale_label,
+        "threshold_reference": args.flux_tail_reference,
     }
 
 
@@ -646,8 +658,11 @@ def render_cutaway(args: argparse.Namespace, pv, spec: DatasetSpec, quantity: st
     if first_bounds is not None:
         set_y_up_camera(plotter, first_bounds)
     mask_suffix = "_se_am" if quantity == "potential" and args.potential_mask == "se_am" else "_se"
+    reference_suffix = ""
+    if quantity in FLUX_QUANTITIES and display.get("threshold_reference") != "merged":
+        reference_suffix = f"_{display['threshold_reference']}_ref"
     mode_suffix = "_high_only" if display["mode"] == "high_only" else ""
-    out_path = spec.output_dir / f"{spec.output_prefix}{mask_suffix}_{quantity}{mode_suffix}.png"
+    out_path = spec.output_dir / f"{spec.output_prefix}{mask_suffix}_{quantity}{reference_suffix}{mode_suffix}.png"
     plotter.screenshot(str(out_path), transparent_background=True)
     plotter.close()
     print(f"Saved {out_path}")
