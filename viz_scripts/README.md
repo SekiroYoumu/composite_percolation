@@ -162,6 +162,8 @@ python viz_scripts/08_analyze_geometry_3d.py
 这两个指标用原始 label 的 6-neighbor 面接触计数计算，不受 3D 渲染降采样影响。
 默认 3D 渲染为了速度会降采样：30 um 用 4x，whole ROI 用 6x；如需更细可以调
 `--representative-render-downsample` 或 `--whole-roi-render-downsample`。
+默认几何图使用 `--render-style strong` 开启光照和 smooth shading，配色为 CAM 深蓝、
+SE-rich 浅蓝、Void/carbon-rich 黄色。如果需要旧的平涂风格，可加 `--render-style flat`。
 
 旧的 AM-SE 和 AM-Void 接触邻接关系单图脚本仍可单独运行：
 

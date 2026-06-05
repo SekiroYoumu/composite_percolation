@@ -15,14 +15,15 @@ from viz_style import apply_publication_style, save_figure, style_axes
 SAMPLES = ("WM", "PFDT")
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 PHASES = (
-    ("CAM", 1, "#d95f02"),
-    ("SE-rich", 2, "#1b9e77"),
-    ("Void/carbon-rich", 3, "#7570b3"),
+    ("CAM", 1, "#376795"),
+    ("SE-rich", 2, "#72bcd5"),
+    ("Void/carbon-rich", 3, "#ffd06f"),
 )
 CONTACT_SPECS = (
-    ("AM-SE contact", 2, "#1b9e77"),
-    ("AM-Void contact", 3, "#7b3294"),
+    ("AM-SE contact", 2, "#72bcd5"),
+    ("AM-Void contact", 3, "#ffd06f"),
 )
+AM_BASE_COLOR = "#6f849b"
 
 
 def parse_args() -> argparse.Namespace:
@@ -50,6 +51,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--crop-fraction", type=float, default=1.0)
     parser.add_argument("--window-width", type=int, default=2200)
     parser.add_argument("--window-height", type=int, default=1500)
+    parser.add_argument(
+        "--contact-render-threshold",
+        type=float,
+        default=0.03,
+        help="Minimum downsampled contact fraction shown in 3D contact maps.",
+    )
+    parser.add_argument(
+        "--render-style",
+        choices=["flat", "soft", "strong"],
+        default="strong",
+        help="3D material preset. soft/strong enable lighting; flat keeps the old unlit rendering.",
+    )
     parser.add_argument("--skip-render", action="store_true")
     return parser.parse_args()
 
@@ -314,6 +327,48 @@ def make_grid(pv, arrays: dict[str, np.ndarray], spacing_um: float):
     return grid
 
 
+def material_args(args: argparse.Namespace, *, opacity: float) -> dict:
+    if args.render_style == "flat":
+        return {
+            "opacity": opacity,
+            "smooth_shading": False,
+            "lighting": False,
+        }
+    if args.render_style == "strong":
+        return {
+            "opacity": opacity,
+            "smooth_shading": True,
+            "lighting": True,
+            "ambient": 0.20,
+            "diffuse": 0.88,
+            "specular": 0.30,
+            "specular_power": 22,
+        }
+    return {
+        "opacity": opacity,
+        "smooth_shading": True,
+        "lighting": True,
+        "ambient": 0.34,
+        "diffuse": 0.74,
+        "specular": 0.16,
+        "specular_power": 16,
+    }
+
+
+def configure_lighting(plotter, pv, args: argparse.Namespace) -> None:
+    if args.render_style == "flat":
+        return
+    try:
+        plotter.enable_lightkit()
+    except Exception:
+        return
+    if args.render_style == "strong":
+        try:
+            plotter.add_light(pv.Light(position=(1, 1.5, 1.7), focal_point=(0, 0, 0), intensity=0.55))
+        except Exception:
+            pass
+
+
 def cutaway_bounds_from_grid(pv, grid, scalar_name: str, threshold: float = 0.05):
     base = grid.threshold(value=threshold, scalars=scalar_name)
     bounds = base.bounds
@@ -338,45 +393,41 @@ def add_outline_axes_title(plotter, pv, bounds, title: str) -> None:
     plotter.add_text(title, position=(0.03, 0.92), font_size=10, viewport=True)
 
 
-def add_phase_panel(plotter, pv, grid, title: str, phase_names: tuple[str, ...]) -> tuple:
+def add_phase_panel(plotter, pv, args: argparse.Namespace, grid, title: str, phase_names: tuple[str, ...]) -> tuple:
     cut, bounds = cutaway_bounds_from_grid(pv, grid, "solid_fraction")
-    opacity = {"CAM": 0.70, "SE-rich": 0.58, "Void/carbon-rich": 0.30}
+    overview_opacity = {"CAM": 0.50, "SE-rich": 0.46, "Void/carbon-rich": 0.38}
+    single_opacity = {"CAM": 0.88, "SE-rich": 0.84, "Void/carbon-rich": 0.78}
     for name, _, color in PHASES:
         if name not in phase_names:
             continue
         phase = cut.threshold(value=0.12, scalars=phase_key(name), method="upper", all_scalars=True)
         if phase.n_points:
+            opacity = overview_opacity[name] if len(phase_names) > 1 else single_opacity[name]
             plotter.add_mesh(
                 phase,
                 color=color,
-                opacity=opacity[name] if len(phase_names) > 1 else 0.82,
                 show_scalar_bar=False,
-                smooth_shading=False,
-                lighting=False,
+                **material_args(args, opacity=opacity),
             )
     add_outline_axes_title(plotter, pv, bounds, title)
     return bounds
 
 
-def add_contact_panel(plotter, pv, grid, title: str, contact_name: str, color: str) -> tuple:
+def add_contact_panel(plotter, pv, args: argparse.Namespace, grid, title: str, contact_name: str, color: str) -> tuple:
     cut, bounds = cutaway_bounds_from_grid(pv, grid, "am_fraction")
     plotter.add_mesh(
         cut,
-        color="#b8b8b8",
-        opacity=0.28,
+        color=AM_BASE_COLOR,
         show_scalar_bar=False,
-        smooth_shading=False,
-        lighting=False,
+        **material_args(args, opacity=0.30),
     )
-    contact = cut.threshold(value=0.5, scalars=contact_name, method="upper", all_scalars=True)
+    contact = cut.threshold(value=args.contact_render_threshold, scalars=contact_name, method="upper", all_scalars=True)
     if contact.n_points:
         plotter.add_mesh(
             contact,
             color=color,
-            opacity=0.95,
             show_scalar_bar=False,
-            smooth_shading=False,
-            lighting=False,
+            **material_args(args, opacity=0.96),
         )
     add_outline_axes_title(plotter, pv, bounds, title)
     return bounds
@@ -406,6 +457,7 @@ def render_phase_overview(args: argparse.Namespace, pv, dataset: str, render_dat
     out_dir.mkdir(parents=True, exist_ok=True)
     plotter = pv.Plotter(shape=(len(SAMPLES), 4), off_screen=True, window_size=(args.window_width, args.window_height))
     plotter.set_background("white")
+    configure_lighting(plotter, pv, args)
     first_bounds = None
     columns: tuple[tuple[str, tuple[str, ...]], ...] = (
         ("Overview", tuple(name for name, _, _ in PHASES)),
@@ -416,7 +468,9 @@ def render_phase_overview(args: argparse.Namespace, pv, dataset: str, render_dat
     for row, sample in enumerate(SAMPLES):
         for col, (title, phase_names) in enumerate(columns):
             plotter.subplot(row, col)
-            bounds = add_phase_panel(plotter, pv, render_data[sample]["phase_grid"], f"{sample} {title}", phase_names)
+            bounds = add_phase_panel(
+                plotter, pv, args, render_data[sample]["phase_grid"], f"{sample} {title}", phase_names
+            )
             set_y_up_camera(plotter, bounds)
             if first_bounds is None:
                 first_bounds = bounds
@@ -437,6 +491,7 @@ def render_contact_maps(args: argparse.Namespace, pv, dataset: str, render_data:
         shape=(len(SAMPLES), len(CONTACT_SPECS)), off_screen=True, window_size=(args.window_width, args.window_height)
     )
     plotter.set_background("white")
+    configure_lighting(plotter, pv, args)
     first_bounds = None
     for row, sample in enumerate(SAMPLES):
         for col, (contact_title, _, color) in enumerate(CONTACT_SPECS):
@@ -444,6 +499,7 @@ def render_contact_maps(args: argparse.Namespace, pv, dataset: str, render_data:
             bounds = add_contact_panel(
                 plotter,
                 pv,
+                args,
                 render_data[sample]["contact_grid"],
                 f"{sample} {contact_title}",
                 contact_key(contact_title),
@@ -484,7 +540,7 @@ def prepare_render_data(args: argparse.Namespace, pv, dataset: str, labels: dict
         contact_arrays = {"am_fraction": block_fraction(am, factor)}
         for title, neighbor_label, _ in CONTACT_SPECS:
             contact = am & six_neighbor(label_xyz == neighbor_label)
-            contact_arrays[contact_key(title)] = block_any(contact, factor)
+            contact_arrays[contact_key(title)] = block_fraction(contact, factor)
         contact_grid = make_grid(pv, contact_arrays, spacing_um)
         out[sample] = {"phase_grid": phase_grid, "contact_grid": contact_grid}
     return out
