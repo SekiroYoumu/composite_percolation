@@ -14,7 +14,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import tifffile as tiff
 
-from viz_style import apply_publication_style, panel_figsize, save_figure, style_axes
+from viz_style import apply_publication_style, panel_figsize, save_figure, style_axes, style_colorbar
 
 
 SAMPLES = ("WM", "PFDT")
@@ -60,6 +60,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--voxel-size-um", type=float, default=0.07)
     parser.add_argument("--direction", default=None, choices=["x", "y", "z"])
     parser.add_argument("--interior-margin-fraction", type=float, default=0.05)
+    parser.add_argument("--potential-p-low", type=float, default=1.0)
+    parser.add_argument("--potential-p-high", type=float, default=99.0)
+    parser.add_argument("--log-flux-p-low", type=float, default=1.0)
+    parser.add_argument("--log-flux-p-high", type=float, default=99.0)
     return parser.parse_args()
 
 
@@ -117,8 +121,12 @@ def load_sample_fields(project_root: Path, representative_root: Path, sample: st
         raise ValueError(f"Invalid direction {direction!r}; expected x/y/z.")
 
     with np.load(npz_path) as data:
+        potential_key = "concentration" if "concentration" in data.files else "potential"
+        if potential_key not in data.files:
+            raise KeyError(f"{npz_path} missing concentration/potential; keys={data.files}")
         if "flux_magnitude" not in data.files:
             raise KeyError(f"{npz_path} missing flux_magnitude; keys={data.files}")
+        potential = np.asarray(data[potential_key], dtype=np.float32)
         flux_magnitude = np.asarray(data["flux_magnitude"], dtype=np.float32)
         flux_vector = None
         if "flux" in data.files:
@@ -126,11 +134,11 @@ def load_sample_fields(project_root: Path, representative_root: Path, sample: st
 
     label_xyz = crop_label_to_representative(project_root, sample, meta)
     if flux_vector is not None:
-        flux_magnitude, label_xyz, flux_vector = common_crop(flux_magnitude, label_xyz, flux_vector)
+        potential, flux_magnitude, label_xyz, flux_vector = common_crop(potential, flux_magnitude, label_xyz, flux_vector)
         transport_abs = np.abs(flux_vector[..., AXIS_INDEX[direction]]).astype(np.float32, copy=False)
         del flux_vector
     else:
-        flux_magnitude, label_xyz = common_crop(flux_magnitude, label_xyz)
+        potential, flux_magnitude, label_xyz = common_crop(potential, flux_magnitude, label_xyz)
         transport_abs = None
 
     se_mask = label_xyz == se_label
@@ -149,6 +157,7 @@ def load_sample_fields(project_root: Path, representative_root: Path, sample: st
         "meta": meta,
         "direction": direction,
         "se_mask": se_mask,
+        "potential": potential,
         "quantities": quantities,
     }
 
@@ -400,6 +409,111 @@ def image_extent_um(image: np.ndarray, plane: str, voxel_um: float) -> tuple[flo
     return 0.0, sizes[axis_h] * voxel_um, 0.0, sizes[axis_v] * voxel_um
 
 
+def transparent_cmap(name: str):
+    cmap = plt.get_cmap(name).copy()
+    cmap.set_bad((0.92, 0.92, 0.92, 1.0))
+    return cmap
+
+
+def masked_center_slice(entry: dict, field: str, plane: str) -> np.ma.MaskedArray:
+    volume = entry[field] if field in entry else entry["quantities"][field]
+    image = center_slices_xyz(volume)[plane]
+    se = center_slices_xyz(entry["se_mask"])[plane]
+    return np.ma.array(image, mask=~se)
+
+
+def se_values(entries: list[dict], field: str) -> np.ndarray:
+    values = []
+    for entry in entries:
+        arr = entry[field]
+        vals = arr[np.isfinite(arr) & entry["se_mask"]]
+        if vals.size:
+            values.append(vals.astype(np.float32, copy=False))
+    return np.concatenate(values) if values else np.array([], dtype=np.float32)
+
+
+def percentile_limits(values: np.ndarray, low: float, high: float) -> tuple[float, float]:
+    if values.size == 0:
+        return 0.0, 1.0
+    vmin, vmax = np.nanpercentile(values, [low, high])
+    if not np.isfinite(vmin) or not np.isfinite(vmax) or vmin == vmax:
+        vmin = float(np.nanmin(values))
+        vmax = float(np.nanmax(values))
+    if vmin == vmax:
+        vmax = vmin + 1.0
+    return float(vmin), float(vmax)
+
+
+def log10_positive(values: np.ndarray) -> np.ndarray:
+    finite_positive = values[np.isfinite(values) & (values > 0)]
+    eps = 1.0e-12 if finite_positive.size == 0 else max(float(np.nanpercentile(finite_positive, 0.1)) * 1.0e-3, 1.0e-12)
+    return np.log10(np.maximum(values, 0.0) + eps)
+
+
+def save_potential_log_flux_maps(
+    entries: list[dict],
+    out_dir: Path,
+    voxel_um: float,
+    potential_limits: tuple[float, float],
+    log_flux_limits: tuple[float, float],
+) -> None:
+    potential_cmap = transparent_cmap("viridis")
+    flux_cmap = transparent_cmap("magma")
+    for plane in PLANES:
+        fig, axes = plt.subplots(
+            2,
+            len(entries),
+            figsize=panel_figsize(len(entries), 2, extra_width_mm=20.0),
+            constrained_layout=False,
+        )
+        fig.subplots_adjust(left=0.08, right=0.86, bottom=0.10, top=0.91, wspace=0.32, hspace=0.52)
+        if len(entries) == 1:
+            axes = axes[:, None]
+        last_images = {}
+        for col, entry in enumerate(entries):
+            subvolume_id = entry["meta"].get("subvolume_id", "representative")
+            for row, (field, title, cmap, limits) in enumerate(
+                (
+                    ("potential", "Potential / concentration", potential_cmap, potential_limits),
+                    ("flux_magnitude", "log10 |J|", flux_cmap, log_flux_limits),
+                )
+            ):
+                ax = axes[row, col]
+                if field == "flux_magnitude":
+                    image = masked_center_slice(entry, field, plane)
+                    image = np.ma.array(log10_positive(np.asarray(image)), mask=np.ma.getmaskarray(image))
+                else:
+                    image = masked_center_slice(entry, field, plane)
+                im = ax.imshow(
+                    image.T,
+                    origin="lower",
+                    cmap=cmap,
+                    interpolation="nearest",
+                    vmin=limits[0],
+                    vmax=limits[1],
+                    extent=image_extent_um(image, plane, voxel_um),
+                    aspect="equal",
+                )
+                last_images[field] = im
+                axis_h, axis_v = PLANE_AXES[plane]
+                if row == 1:
+                    ax.set_xlabel(f"{axis_h} (um)")
+                else:
+                    ax.tick_params(labelbottom=False)
+                ax.set_ylabel(f"{axis_v} (um)")
+                ax.set_title(f"{entry['sample']} {subvolume_id}\n{title}")
+        for row, (field, label) in enumerate(
+            (("potential", "Potential / concentration"), ("flux_magnitude", "log10 |J|"))
+        ):
+            cbar = fig.colorbar(last_images[field], ax=axes[row, :], shrink=0.80, label=label)
+            style_colorbar(cbar)
+        style_axes(axes)
+        path = out_dir / f"representative30_potential_log_flux_comparison_{plane}.png"
+        save_figure(fig, path)
+        plt.close(fig)
+        print(f"Saved {path}")
+
+
 def save_low_high_maps(entries: list[dict], out_dir: Path, quantity: str, voxel_um: float,
                        global_median: float) -> None:
     quantity_label = QUANTITY_LABELS.get(quantity, quantity)
@@ -458,6 +572,19 @@ def main() -> None:
         load_sample_fields(project_root, representative_root, sample, args.se_label, args.se_threshold, args.direction)
         for sample in SAMPLES
     ]
+    potential_limits = percentile_limits(
+        se_values(entries, "potential"), args.potential_p_low, args.potential_p_high
+    )
+    log_flux_values = np.concatenate(
+        [
+            log10_positive(entry["quantities"]["flux_magnitude"])[entry["se_mask"]]
+            for entry in entries
+            if np.any(entry["se_mask"])
+        ]
+    )
+    log_flux_limits = percentile_limits(log_flux_values, args.log_flux_p_low, args.log_flux_p_high)
+    save_potential_log_flux_maps(entries, out_dir, args.voxel_size_um, potential_limits, log_flux_limits)
+
     quantities = sorted(set().union(*(entry["quantities"].keys() for entry in entries)))
     rows = []
     for quantity in quantities:
