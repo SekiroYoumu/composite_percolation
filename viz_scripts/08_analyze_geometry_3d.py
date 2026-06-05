@@ -24,6 +24,10 @@ CONTACT_SPECS = (
     ("AM-Void contact", 3, "#ffd06f"),
 )
 AM_BASE_COLOR = "#6f849b"
+SAMPLE_COLORS = {
+    "WM": "#376795",
+    "PFDT": "#72bcd5",
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -101,6 +105,26 @@ def representative_metadata(args: argparse.Namespace, sample: str) -> dict:
     return read_json(Path(args.representative_root) / sample / "representative_flux" / "metadata.json")
 
 
+def representative_subvolume_rows(args: argparse.Namespace, sample: str) -> list[dict]:
+    subvolumes_path = Path(args.representative_root) / sample / "subvolumes.csv"
+    if not subvolumes_path.exists():
+        meta = representative_metadata(args, sample)
+        coords = meta.get("coordinates", {})
+        if coords:
+            return [{"subvolume_id": meta.get("subvolume_id", "representative"), **coords}]
+        return []
+    with subvolumes_path.open(newline="", encoding="utf-8") as f:
+        return list(csv.DictReader(f))
+
+
+def crop_label_to_subvolume_row(label_zyx: np.ndarray, row: dict) -> np.ndarray:
+    return label_zyx[
+        int(row["z0"]): int(row["z1"]),
+        int(row["y0"]): int(row["y1"]),
+        int(row["x0"]): int(row["x1"]),
+    ]
+
+
 def crop_label_to_metadata(label_zyx: np.ndarray, meta: dict) -> np.ndarray:
     coords = meta.get("coordinates")
     if not coords:
@@ -129,6 +153,29 @@ def load_label_zyx(args: argparse.Namespace, dataset: str, sample: str) -> np.nd
         label_zyx = crop_label_to_metadata(label_zyx, representative_metadata(args, sample))
     label_zyx = center_crop(label_zyx, args.crop_fraction)
     return label_zyx.astype(np.uint8, copy=False)
+
+
+def iter_metric_label_zyx(
+    args: argparse.Namespace, dataset: str, sample: str
+) -> list[tuple[str, dict[str, int], np.ndarray]]:
+    label_zyx = tiff.imread(label_path(Path(args.project_root), sample)).astype(np.uint8, copy=False)
+    if dataset != "representative30":
+        label_zyx = center_crop(label_zyx, args.crop_fraction)
+        return [("whole_roi", {}, label_zyx)]
+
+    metric_labels = []
+    for row in representative_subvolume_rows(args, sample):
+        region_id = str(row.get("subvolume_id") or "representative")
+        coords = {key: int(row[key]) for key in ("x0", "x1", "y0", "y1", "z0", "z1") if key in row}
+        subvolume_zyx = crop_label_to_subvolume_row(label_zyx, row)
+        subvolume_zyx = center_crop(subvolume_zyx, args.crop_fraction)
+        metric_labels.append((region_id, coords, subvolume_zyx))
+    if not metric_labels:
+        meta = representative_metadata(args, sample)
+        label_zyx = crop_label_to_metadata(label_zyx, meta)
+        label_zyx = center_crop(label_zyx, args.crop_fraction)
+        metric_labels.append((str(meta.get("subvolume_id", "representative")), {}, label_zyx))
+    return metric_labels
 
 
 def zyx_to_xyz(label_zyx: np.ndarray) -> np.ndarray:
@@ -226,7 +273,14 @@ def percolates_axis(mask: np.ndarray, axis: int) -> bool:
     return bool(lo_labels & hi_labels)
 
 
-def compute_metrics(args: argparse.Namespace, dataset: str, sample: str, label_zyx: np.ndarray) -> dict:
+def compute_metrics(
+    args: argparse.Namespace,
+    dataset: str,
+    sample: str,
+    label_zyx: np.ndarray,
+    region_id: str,
+    region_coords: dict[str, int] | None = None,
+) -> dict:
     voxel_size = float(args.voxel_size_um)
     voxel_volume = voxel_size ** 3
     face_area = voxel_size ** 2
@@ -234,11 +288,14 @@ def compute_metrics(args: argparse.Namespace, dataset: str, sample: str, label_z
     row: dict[str, int | float | str | bool] = {
         "dataset": dataset,
         "sample": sample,
+        "region_id": region_id,
         "shape_zyx": "x".join(str(v) for v in label_zyx.shape),
         "voxel_size_um": voxel_size,
         "voxel_count": total_voxels,
         "volume_um3": float(total_voxels * voxel_volume),
     }
+    for key, value in (region_coords or {}).items():
+        row[key] = value
     labels = {name: value for name, value, _ in PHASES}
     for name, value in labels.items():
         count = int(np.count_nonzero(label_zyx == value))
@@ -560,13 +617,37 @@ def six_neighbor(mask: np.ndarray) -> np.ndarray:
 def write_metrics(rows: list[dict], out_path: Path) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fieldnames = sorted({key for row in rows for key in row})
-    leading = ["dataset", "sample", "shape_zyx", "voxel_size_um", "voxel_count", "volume_um3"]
+    leading = [
+        "dataset",
+        "sample",
+        "region_id",
+        "x0",
+        "x1",
+        "y0",
+        "y1",
+        "z0",
+        "z1",
+        "shape_zyx",
+        "voxel_size_um",
+        "voxel_count",
+        "volume_um3",
+    ]
     fieldnames = leading + [key for key in fieldnames if key not in leading]
-    with out_path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(rows)
-    print(f"Saved {out_path}")
+
+    def write_csv(path: Path) -> None:
+        with path.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(rows)
+
+    try:
+        write_csv(out_path)
+        saved_path = out_path
+    except PermissionError:
+        saved_path = out_path.with_name(f"{out_path.stem}_latest{out_path.suffix}")
+        write_csv(saved_path)
+        print(f"Could not overwrite locked file {out_path}; wrote fallback copy instead.")
+    print(f"Saved {saved_path}")
 
 
 def plot_contact_metric_summary(rows: list[dict], out_path: Path) -> None:
@@ -583,14 +664,47 @@ def plot_contact_metric_summary(rows: list[dict], out_path: Path) -> None:
     width = 0.34
     for ax, (key, label) in zip(np.ravel(axes), metrics):
         for offset, sample in [(-width / 2, "WM"), (width / 2, "PFDT")]:
-            values = []
+            means = []
+            errors = []
+            grouped_values = []
             for dataset in datasets:
-                match = next(row for row in rows if row["dataset"] == dataset and row["sample"] == sample)
-                values.append(float(match[key]))
-            ax.bar(x + offset, values, width=width, label=sample)
+                values = [
+                    float(row[key])
+                    for row in rows
+                    if row["dataset"] == dataset
+                    and row["sample"] == sample
+                    and key in row
+                    and np.isfinite(float(row[key]))
+                ]
+                grouped_values.append(values)
+                means.append(float(np.mean(values)) if values else float("nan"))
+                errors.append(float(np.std(values, ddof=1)) if len(values) > 1 else 0.0)
+            ax.bar(
+                x + offset,
+                means,
+                width=width,
+                yerr=errors,
+                capsize=2.5,
+                color=SAMPLE_COLORS[sample],
+                label=sample,
+                error_kw={"elinewidth": 0.9, "capthick": 0.9},
+            )
+            for i, values in enumerate(grouped_values):
+                if len(values) <= 1:
+                    continue
+                jitter = np.linspace(-0.045, 0.045, len(values))
+                ax.scatter(
+                    np.full(len(values), x[i] + offset) + jitter,
+                    values,
+                    s=9,
+                    color="#2f2f2f",
+                    alpha=0.55,
+                    linewidths=0,
+                    zorder=3,
+                )
         ax.set_xticks(x, [dataset_labels.get(dataset, dataset) for dataset in datasets])
         ax.set_ylabel(label)
-        ax.set_ylim(0, 1)
+        ax.set_ylim(0, 1.05)
         style_axes(ax, minor=False)
     axes[0].legend(frameon=False, fontsize=9)
     save_figure(fig, out_path)
@@ -611,11 +725,12 @@ def main() -> None:
 
     all_rows = []
     for dataset in datasets_to_run(args.dataset):
-        labels = {sample: load_label_zyx(args, dataset, sample) for sample in SAMPLES}
-        for sample, label_zyx in labels.items():
-            print(f"{dataset} {sample}: label shape zyx={label_zyx.shape}")
-            all_rows.append(compute_metrics(args, dataset, sample, label_zyx))
+        for sample in SAMPLES:
+            for region_id, region_coords, label_zyx in iter_metric_label_zyx(args, dataset, sample):
+                print(f"{dataset} {sample} {region_id}: label shape zyx={label_zyx.shape}")
+                all_rows.append(compute_metrics(args, dataset, sample, label_zyx, region_id, region_coords))
         if pv is not None:
+            labels = {sample: load_label_zyx(args, dataset, sample) for sample in SAMPLES}
             render_data = prepare_render_data(args, pv, dataset, labels)
             render_phase_overview(args, pv, dataset, render_data)
             render_contact_maps(args, pv, dataset, render_data)
