@@ -62,8 +62,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--interior-margin-fraction", type=float, default=0.05)
     parser.add_argument("--potential-p-low", type=float, default=1.0)
     parser.add_argument("--potential-p-high", type=float, default=99.0)
-    parser.add_argument("--log-flux-p-low", type=float, default=1.0)
-    parser.add_argument("--log-flux-p-high", type=float, default=99.0)
+    parser.add_argument("--flux-p-low", type=float, default=1.0)
+    parser.add_argument("--flux-p-high", type=float, default=99.0)
     return parser.parse_args()
 
 
@@ -444,18 +444,16 @@ def percentile_limits(values: np.ndarray, low: float, high: float) -> tuple[floa
     return float(vmin), float(vmax)
 
 
-def log10_positive(values: np.ndarray) -> np.ndarray:
-    finite_positive = values[np.isfinite(values) & (values > 0)]
-    eps = 1.0e-12 if finite_positive.size == 0 else max(float(np.nanpercentile(finite_positive, 0.1)) * 1.0e-3, 1.0e-12)
-    return np.log10(np.maximum(values, 0.0) + eps)
-
-
-def save_potential_log_flux_maps(
+def save_potential_linear_flux_maps(
     entries: list[dict],
     out_dir: Path,
     voxel_um: float,
     potential_limits: tuple[float, float],
-    log_flux_limits: tuple[float, float],
+    flux_limits: tuple[float, float],
+    flux_field: str,
+    flux_title: str,
+    flux_label: str,
+    filename_token: str,
 ) -> None:
     potential_cmap = transparent_cmap("viridis")
     flux_cmap = transparent_cmap("magma")
@@ -475,15 +473,11 @@ def save_potential_log_flux_maps(
             for row, (field, title, cmap, limits) in enumerate(
                 (
                     ("potential", "Potential / concentration", potential_cmap, potential_limits),
-                    ("flux_magnitude", "log10 |J|", flux_cmap, log_flux_limits),
+                    (flux_field, flux_title, flux_cmap, flux_limits),
                 )
             ):
                 ax = axes[row, col]
-                if field == "flux_magnitude":
-                    image = masked_center_slice(entry, field, plane)
-                    image = np.ma.array(log10_positive(np.asarray(image)), mask=np.ma.getmaskarray(image))
-                else:
-                    image = masked_center_slice(entry, field, plane)
+                image = masked_center_slice(entry, field, plane)
                 im = ax.imshow(
                     image.T,
                     origin="lower",
@@ -503,12 +497,12 @@ def save_potential_log_flux_maps(
                 ax.set_ylabel(f"{axis_v} (um)")
                 ax.set_title(f"{entry['sample']} {subvolume_id}\n{title}")
         for row, (field, label) in enumerate(
-            (("potential", "Potential / concentration"), ("flux_magnitude", "log10 |J|"))
+            (("potential", "Potential / concentration"), (flux_field, flux_label))
         ):
             cbar = fig.colorbar(last_images[field], ax=axes[row, :], shrink=0.80, label=label)
             style_colorbar(cbar)
         style_axes(axes)
-        path = out_dir / f"representative30_potential_log_flux_comparison_{plane}.png"
+        path = out_dir / f"representative30_potential_{filename_token}_linear_comparison_{plane}.png"
         save_figure(fig, path)
         plt.close(fig)
         print(f"Saved {path}")
@@ -575,15 +569,47 @@ def main() -> None:
     potential_limits = percentile_limits(
         se_values(entries, "potential"), args.potential_p_low, args.potential_p_high
     )
-    log_flux_values = np.concatenate(
+    flux_values = np.concatenate(
         [
-            log10_positive(entry["quantities"]["flux_magnitude"])[entry["se_mask"]]
+            entry["quantities"]["flux_magnitude"][entry["se_mask"]]
             for entry in entries
             if np.any(entry["se_mask"])
         ]
     )
-    log_flux_limits = percentile_limits(log_flux_values, args.log_flux_p_low, args.log_flux_p_high)
-    save_potential_log_flux_maps(entries, out_dir, args.voxel_size_um, potential_limits, log_flux_limits)
+    flux_limits = percentile_limits(flux_values, args.flux_p_low, args.flux_p_high)
+    save_potential_linear_flux_maps(
+        entries,
+        out_dir,
+        args.voxel_size_um,
+        potential_limits,
+        flux_limits,
+        "flux_magnitude",
+        "Flux magnitude",
+        "Flux magnitude",
+        "flux",
+    )
+
+    abs_jy_key = next((key for key in entries[0]["quantities"] if key.lower() == "abs_jy"), None)
+    if abs_jy_key is not None and all(abs_jy_key in entry["quantities"] for entry in entries):
+        jy_values = np.concatenate(
+            [
+                entry["quantities"][abs_jy_key][entry["se_mask"]]
+                for entry in entries
+                if np.any(entry["se_mask"])
+            ]
+        )
+        jy_limits = percentile_limits(jy_values, args.flux_p_low, args.flux_p_high)
+        save_potential_linear_flux_maps(
+            entries,
+            out_dir,
+            args.voxel_size_um,
+            potential_limits,
+            jy_limits,
+            abs_jy_key,
+            "|Jy|",
+            "|Jy|",
+            "abs_Jy",
+        )
 
     quantities = sorted(set().union(*(entry["quantities"].keys() for entry in entries)))
     rows = []
