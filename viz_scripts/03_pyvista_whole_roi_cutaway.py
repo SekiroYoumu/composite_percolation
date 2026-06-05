@@ -63,7 +63,14 @@ def parse_args() -> argparse.Namespace:
         default=PROJECT_ROOT / "viz" / "representative30_3d_cutaway",
     )
     parser.add_argument("--se-label", type=int, default=2)
+    parser.add_argument("--am-label", type=int, default=1)
     parser.add_argument("--se-threshold", type=float, default=0.5)
+    parser.add_argument(
+        "--potential-mask",
+        choices=["se", "se_am"],
+        default="se",
+        help="Mask used for potential rendering. Flux quantities always use the SE-only mask.",
+    )
     parser.add_argument("--voxel-size-um", type=float, default=0.07)
     parser.add_argument("--downsample-factor", type=int, default=None)
     parser.add_argument("--representative-downsample-factor", type=int, default=2)
@@ -171,20 +178,20 @@ def block_mean(array: np.ndarray, factor: int) -> np.ndarray:
     return reshaped.mean(axis=(1, 3, 5), dtype=np.float32)
 
 
-def downsample_se_fraction(
+def downsample_label_fraction(
     label_zyx: np.ndarray,
-    se_label: int,
+    mask_labels: tuple[int, ...],
     factor: int,
     target_shape: tuple[int, int, int],
 ) -> np.ndarray:
     label_xyz = np.transpose(label_zyx, (2, 1, 0))
-    se = label_xyz == se_label
+    mask = np.isin(label_xyz, mask_labels)
     if factor <= 1:
-        common = tuple(min(a, b) for a, b in zip(se.shape, target_shape))
-        return se[tuple(slice(0, n) for n in common)].astype(np.float32, copy=False)
-    crop_shape = tuple(min(se.shape[i], target_shape[i] * factor) for i in range(3))
+        common = tuple(min(a, b) for a, b in zip(mask.shape, target_shape))
+        return mask[tuple(slice(0, n) for n in common)].astype(np.float32, copy=False)
+    crop_shape = tuple(min(mask.shape[i], target_shape[i] * factor) for i in range(3))
     crop_shape = tuple((n // factor) * factor for n in crop_shape)
-    cropped = se[tuple(slice(0, n) for n in crop_shape)].astype(np.float32, copy=False)
+    cropped = mask[tuple(slice(0, n) for n in crop_shape)].astype(np.float32, copy=False)
     reshaped = cropped.reshape(
         crop_shape[0] // factor,
         factor,
@@ -196,6 +203,18 @@ def downsample_se_fraction(
     fraction = reshaped.mean(axis=(1, 3, 5), dtype=np.float32)
     common = tuple(min(a, b) for a, b in zip(fraction.shape, target_shape))
     return fraction[tuple(slice(0, n) for n in common)]
+
+
+def mask_labels_for_quantity(args: argparse.Namespace, quantity: str) -> tuple[int, ...]:
+    if quantity == "potential" and args.potential_mask == "se_am":
+        return (int(args.am_label), int(args.se_label))
+    return (int(args.se_label),)
+
+
+def mask_label_for_display(args: argparse.Namespace, quantity: str) -> str:
+    if quantity == "potential" and args.potential_mask == "se_am":
+        return "SE+AM"
+    return "SE-only"
 
 
 def finite_se_values(scalar: np.ndarray, se_fraction: np.ndarray, se_threshold: float) -> np.ndarray:
@@ -215,9 +234,9 @@ def load_whole_roi_entry(args: argparse.Namespace, sample: str, quantity: str) -
         scalar = np.asarray(data[key], dtype=np.float32)
 
     downsample = args.downsample_factor or int(meta.get("downsample_factor", 2))
-    se_fraction = downsample_se_fraction(
+    se_fraction = downsample_label_fraction(
         tiff.imread(label_path(Path(args.project_root), sample)),
-        args.se_label,
+        mask_labels_for_quantity(args, quantity),
         downsample,
         scalar.shape,
     )
@@ -251,7 +270,7 @@ def load_representative30_entry(args: argparse.Namespace, sample: str, quantity:
 
     label_zyx = tiff.imread(label_path(Path(args.project_root), sample))
     label_xyz = np.transpose(crop_label_to_metadata(label_zyx, meta), (2, 1, 0))
-    se_fraction = (label_xyz == args.se_label).astype(np.float32, copy=False)
+    se_fraction = np.isin(label_xyz, mask_labels_for_quantity(args, quantity)).astype(np.float32, copy=False)
     scalar, se_fraction = common_crop(scalar, se_fraction)
     scalar = center_crop(scalar, args.crop_fraction)
     se_fraction = center_crop(se_fraction, args.crop_fraction)
@@ -379,13 +398,14 @@ def add_continuous_cutaway_mesh(
         show_scalar_bar=show_scalar_bar,
         scalar_bar_args={
             "title": scalar_label,
+            "vertical": True,
             "n_labels": 3,
             "fmt": "%.2f",
-            "title_font_size": 16,
-            "label_font_size": 14,
-            "position_x": 0.885,
+            "title_font_size": 10,
+            "label_font_size": 9,
+            "position_x": 0.865,
             "position_y": 0.22,
-            "width": 0.045,
+            "width": 0.06,
             "height": 0.42,
         } if show_scalar_bar else None,
         smooth_shading=False,
@@ -554,11 +574,12 @@ def quantities_for_dataset(dataset: str, requested: str) -> list[str]:
 
 def load_entries(args: argparse.Namespace, dataset: str, quantity: str) -> list[dict]:
     loader = load_whole_roi_entry if dataset == "whole_roi" else load_representative30_entry
+    mask_label = mask_label_for_display(args, quantity)
     entries = [loader(args, sample, quantity) for sample in SAMPLES]
     for entry in entries:
         print(
-            f"{dataset} {entry['sample']} {quantity}: "
-            f"scalar={entry['scalar'].shape}, se_fraction={entry['se_fraction'].shape}, "
+            f"{dataset} {entry['sample']} {mask_label} {quantity}: "
+            f"scalar={entry['scalar'].shape}, mask_fraction={entry['se_fraction'].shape}, "
             f"downsample={entry['downsample']}, spacing={entry['spacing_um']:.3g} um"
         )
     return entries
@@ -567,6 +588,7 @@ def load_entries(args: argparse.Namespace, dataset: str, quantity: str) -> list[
 def render_cutaway(args: argparse.Namespace, pv, spec: DatasetSpec, quantity: str) -> Path:
     entries = load_entries(args, spec.name, quantity)
     display = display_entries(entries, quantity, args)
+    mask_label = mask_label_for_display(args, quantity)
     if display["mode"] == "continuous":
         print(f"Shared color limits for {spec.name} {display['label']}: {display['clim']}")
 
@@ -585,7 +607,7 @@ def render_cutaway(args: argparse.Namespace, pv, spec: DatasetSpec, quantity: st
                 plotter,
                 pv,
                 grid,
-                f"{entry['sample']} SE-only {display['label']}",
+                f"{entry['sample']} {mask_label} {display['label']}",
                 display["label"],
                 display["cmap"],
                 args.se_threshold,
@@ -623,8 +645,9 @@ def render_cutaway(args: argparse.Namespace, pv, spec: DatasetSpec, quantity: st
     plotter.link_views()
     if first_bounds is not None:
         set_y_up_camera(plotter, first_bounds)
-    suffix = "_high_only" if display["mode"] == "high_only" else ""
-    out_path = spec.output_dir / f"{spec.output_prefix}_se_{quantity}{suffix}.png"
+    mask_suffix = "_se_am" if quantity == "potential" and args.potential_mask == "se_am" else "_se"
+    mode_suffix = "_high_only" if display["mode"] == "high_only" else ""
+    out_path = spec.output_dir / f"{spec.output_prefix}{mask_suffix}_{quantity}{mode_suffix}.png"
     plotter.screenshot(str(out_path), transparent_background=True)
     plotter.close()
     print(f"Saved {out_path}")

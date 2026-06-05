@@ -107,6 +107,13 @@ python viz_scripts/03_pyvista_whole_roi_cutaway.py --dataset representative30 --
 
 high-only 模式只保留灰色 SE 背景和红色 top tail，并输出带 `_high_only` 后缀的 PNG，
 不会覆盖默认 tail map。
+potential 默认仍为 SE-only mask。如果需要显示 SE+AM 两相内的电势场，可以运行：
+
+```bash
+python viz_scripts/03_pyvista_whole_roi_cutaway.py --quantity potential --potential-mask se_am
+```
+
+SE+AM potential 会输出为 `_se_am_potential.png`，不覆盖原来的 `_se_potential.png`。
 whole ROI 数据只保存了 `flux_magnitude`，30 um representative 数据保存了完整的
 `flux` vector，因此 30 um 会额外输出沿传输方向的 `abs_Jy` 3D map。
 
