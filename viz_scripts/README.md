@@ -165,6 +165,39 @@ python viz_scripts/08_analyze_geometry_3d.py
 默认几何图使用 `--render-style strong` 开启光照和 smooth shading，配色为 CAM 深蓝、
 SE-rich 浅蓝、Void/carbon-rich 黄色。如果需要旧的平涂风格，可加 `--render-style flat`。
 
+## Fig. 3d AM 表面 void-exposed contact-state map
+
+为了避免 AM-SE / AM-Void 两张独立 contact cube 互相割裂，Fig. 3d 推荐使用 AM 表面状态图：
+
+```bash
+python viz_scripts/09_plot_am_surface_contact_state_3d.py
+```
+
+默认输出：
+
+- `viz/am_surface_contact_state_3d/representative30_am_surface_void_exposed_majority_r2_3d.png`
+- `viz/am_surface_contact_state_3d/representative30_am_surface_contact_definition_comparison.csv`
+
+这张图只强调 void/carbon-exposed AM surface：AM 总表面以浅灰、低透明度显示，
+void/carbon-rich 暴露区域以橙黄色高不透明度叠加；SE-covered surface 默认不单独上色。
+推荐的 contact 定义为 `majority_r2`：对 AM 表面 voxel，在 2 voxel 邻域内统计
+SE-rich 与 Void/carbon-rich voxel 数，多数相决定该 AM 表面区域的覆盖状态。
+这比 1-voxel 邻接更抗 segmentation 边界噪声。
+
+旧的 1-voxel face contact 定义没有删除，可以用同一脚本对照：
+
+```bash
+python viz_scripts/09_plot_am_surface_contact_state_3d.py --contact-mode face1
+```
+
+输出：
+
+- `viz/am_surface_contact_state_3d/representative30_am_surface_void_exposed_face1_3d.png`
+
+CSV 中同时保存 `face1` 和 `majority_r2` 的 AM-SE / AM-Void 比例，方便判断 robust
+定义是否改变结论。当前结果中 `majority_r2` 会降低边界噪声导致的 void-exposed 比例，
+但 WM 仍显著高于 PFDT，机制结论不变。
+
 旧的 AM-SE 和 AM-Void 接触邻接关系单图脚本仍可单独运行：
 
 ```bash

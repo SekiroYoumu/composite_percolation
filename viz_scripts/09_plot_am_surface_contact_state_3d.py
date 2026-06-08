@@ -10,13 +10,18 @@ import tifffile as tiff
 
 
 SAMPLES = ("WM", "PFDT")
+SAMPLE_TITLES = {
+    "WM": "WM-LPSCB",
+    "PFDT": "PFDT@LPSCB",
+}
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 CAM_LABEL = 1
 SE_LABEL = 2
 VOID_LABEL = 3
 STATE_COLORS = {
+    "base": "#c8c8c8",
     "se": "#72bcd5",
-    "void": "#ffd06f",
+    "void": "#f2b84b",
     "other": "#b8b8b8",
 }
 
@@ -37,17 +42,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--whole-roi-downsample", type=int, default=6)
     parser.add_argument("--crop-fraction", type=float, default=1.0)
     parser.add_argument("--surface-threshold", type=float, default=0.50)
+    parser.add_argument(
+        "--contact-radius",
+        type=int,
+        default=2,
+        help="Voxel radius used to assign each AM surface voxel by local SE/void majority.",
+    )
+    parser.add_argument(
+        "--contact-mode",
+        choices=["majority", "face1"],
+        default="majority",
+        help="Contact-state definition used for the rendered surface. Metrics CSV always includes both modes.",
+    )
     parser.add_argument("--cutaway-start-fraction", type=float, default=0.56)
-    parser.add_argument("--se-opacity", type=float, default=0.82)
+    parser.add_argument("--base-opacity", type=float, default=0.12)
+    parser.add_argument("--se-opacity", type=float, default=0.0)
     parser.add_argument("--void-opacity", type=float, default=0.98)
     parser.add_argument("--other-opacity", type=float, default=0.0)
-    parser.add_argument("--void-state-threshold", type=float, default=0.55)
-    parser.add_argument(
-        "--max-faces-per-state",
-        type=int,
-        default=0,
-        help="Optional deterministic cap per sample/state for faster previews. 0 renders all faces.",
-    )
+    parser.add_argument("--void-state-threshold", type=float, default=0.30)
     parser.add_argument("--window-width", type=int, default=1900)
     parser.add_argument("--window-height", type=int, default=900)
     return parser.parse_args()
@@ -114,23 +126,6 @@ def load_label_xyz(args: argparse.Namespace, sample: str) -> np.ndarray:
     return np.transpose(label_zyx.astype(np.uint8, copy=False), (2, 1, 0))
 
 
-def block_mode_labels(label_xyz: np.ndarray, factor: int) -> np.ndarray:
-    if factor <= 1:
-        return label_xyz.astype(np.uint8, copy=False)
-    crop_shape = tuple((dim // factor) * factor for dim in label_xyz.shape)
-    cropped = label_xyz[tuple(slice(0, n) for n in crop_shape)]
-    reshaped = cropped.reshape(
-        crop_shape[0] // factor,
-        factor,
-        crop_shape[1] // factor,
-        factor,
-        crop_shape[2] // factor,
-        factor,
-    )
-    counts = np.stack([(reshaped == label).sum(axis=(1, 3, 5)) for label in (0, 1, 2, 3)], axis=0)
-    return np.argmax(counts, axis=0).astype(np.uint8, copy=False)
-
-
 def block_fraction(mask: np.ndarray, factor: int) -> np.ndarray:
     if factor <= 1:
         return mask.astype(np.float32, copy=False)
@@ -145,26 +140,6 @@ def block_fraction(mask: np.ndarray, factor: int) -> np.ndarray:
         factor,
     )
     return reshaped.mean(axis=(1, 3, 5), dtype=np.float32)
-
-
-def apply_cutaway(label_xyz: np.ndarray, start_fraction: float) -> np.ndarray:
-    if start_fraction >= 0.999:
-        return label_xyz
-    out = label_xyz.copy()
-    nx, ny, nz = out.shape
-    x0 = int(round(nx * start_fraction))
-    y0 = int(round(ny * start_fraction))
-    z0 = int(round(nz * start_fraction))
-    out[x0:, y0:, z0:] = 0
-    return out
-
-
-def state_name(neighbor_label: int) -> str:
-    if neighbor_label == SE_LABEL:
-        return "se"
-    if neighbor_label == VOID_LABEL:
-        return "void"
-    return "other"
 
 
 def face_state_counts(label_xyz: np.ndarray) -> dict[str, int]:
@@ -191,6 +166,37 @@ def face_state_counts(label_xyz: np.ndarray) -> dict[str, int]:
     return counts
 
 
+def contact_total(counts: dict[str, int]) -> int:
+    return int(counts.get("se", 0) + counts.get("void", 0))
+
+
+def counts_to_metric_row(
+    dataset: str,
+    sample: str,
+    mode: str,
+    counts: dict[str, int],
+    unit: str,
+    radius: int | None = None,
+) -> dict[str, int | float | str]:
+    total = contact_total(counts)
+    surface_total = int(counts.get("surface", counts.get("se", 0) + counts.get("void", 0) + counts.get("other", 0)))
+    return {
+        "dataset": dataset,
+        "sample": sample,
+        "contact_mode": mode,
+        "contact_unit": unit,
+        "contact_radius_voxels": "" if radius is None else radius,
+        "am_surface_total_count": surface_total,
+        "am_se_count": counts.get("se", 0),
+        "am_void_count": counts.get("void", 0),
+        "am_other_count": counts.get("other", 0),
+        "am_se_fraction_of_classified_contact": counts.get("se", 0) / total if total else np.nan,
+        "am_void_fraction_of_classified_contact": counts.get("void", 0) / total if total else np.nan,
+        "am_se_fraction_of_am_surface": counts.get("se", 0) / surface_total if surface_total else np.nan,
+        "am_void_fraction_of_am_surface": counts.get("void", 0) / surface_total if surface_total else np.nan,
+    }
+
+
 def six_neighbor(mask: np.ndarray) -> np.ndarray:
     out = np.zeros(mask.shape, dtype=bool)
     out[1:, :, :] |= mask[:-1, :, :]
@@ -200,6 +206,54 @@ def six_neighbor(mask: np.ndarray) -> np.ndarray:
     out[:, :, 1:] |= mask[:, :, :-1]
     out[:, :, :-1] |= mask[:, :, 1:]
     return out
+
+
+def am_surface_mask(label_xyz: np.ndarray) -> np.ndarray:
+    am = label_xyz == CAM_LABEL
+    return am & six_neighbor(~am)
+
+
+def local_phase_count(mask: np.ndarray, radius: int) -> np.ndarray:
+    if radius <= 0:
+        return mask.astype(np.uint16, copy=False)
+    try:
+        from scipy import ndimage
+
+        kernel = np.ones((2 * radius + 1, 2 * radius + 1, 2 * radius + 1), dtype=np.uint8)
+        return ndimage.convolve(mask.astype(np.uint8, copy=False), kernel, mode="constant", cval=0).astype(
+            np.uint16, copy=False
+        )
+    except ImportError:
+        out = np.zeros(mask.shape, dtype=np.uint16)
+        padded = np.pad(mask.astype(np.uint8, copy=False), radius, mode="constant")
+        for dx in range(2 * radius + 1):
+            for dy in range(2 * radius + 1):
+                for dz in range(2 * radius + 1):
+                    out += padded[
+                        dx : dx + mask.shape[0],
+                        dy : dy + mask.shape[1],
+                        dz : dz + mask.shape[2],
+                    ]
+        return out
+
+
+def majority_contact_masks(label_xyz: np.ndarray, radius: int) -> dict[str, np.ndarray]:
+    surface = am_surface_mask(label_xyz)
+    se_count = local_phase_count(label_xyz == SE_LABEL, radius)
+    void_count = local_phase_count(label_xyz == VOID_LABEL, radius)
+    classified = surface & ((se_count + void_count) > 0)
+    void_exposed = classified & (void_count > se_count)
+    se_covered = classified & ~void_exposed
+    other = surface & ~classified
+    return {"surface": surface, "se": se_covered, "void": void_exposed, "other": other}
+
+
+def face_contact_masks(label_xyz: np.ndarray) -> dict[str, np.ndarray]:
+    surface = am_surface_mask(label_xyz)
+    void_exposed = surface & six_neighbor(label_xyz == VOID_LABEL)
+    se_covered = surface & six_neighbor(label_xyz == SE_LABEL) & ~void_exposed
+    other = surface & ~(se_covered | void_exposed)
+    return {"surface": surface, "se": se_covered, "void": void_exposed, "other": other}
 
 
 def make_grid(pv, arrays: dict[str, np.ndarray], spacing_um: float):
@@ -240,6 +294,7 @@ def as_smooth_surface(mesh):
 def make_state_surfaces(
     pv,
     label_xyz: np.ndarray,
+    contact_masks: dict[str, np.ndarray],
     factor: int,
     spacing_um: float,
     surface_threshold: float,
@@ -247,20 +302,21 @@ def make_state_surfaces(
     void_state_threshold: float,
 ) -> tuple[dict[str, object], tuple[float, float, float, float, float, float]]:
     am = label_xyz == CAM_LABEL
-    se_contact = am & six_neighbor(label_xyz == SE_LABEL)
-    void_contact = am & six_neighbor(label_xyz == VOID_LABEL)
     am_fraction = block_fraction(am, factor)
-    se_fraction = block_fraction(se_contact, factor)
-    void_fraction = block_fraction(void_contact, factor)
-    classified = se_fraction + void_fraction
-    void_state = np.divide(void_fraction, classified, out=np.zeros_like(void_fraction), where=classified > 0)
+    surface_fraction = block_fraction(contact_masks["surface"], factor)
+    se_fraction = block_fraction(contact_masks["se"], factor)
+    void_fraction = block_fraction(contact_masks["void"], factor)
+    other_fraction = block_fraction(contact_masks["other"], factor)
+    void_state = np.divide(void_fraction, surface_fraction, out=np.zeros_like(void_fraction), where=surface_fraction > 0)
+    se_state = np.divide(se_fraction, surface_fraction, out=np.zeros_like(se_fraction), where=surface_fraction > 0)
     grid = make_grid(
         pv,
         {
             "am_fraction": am_fraction,
-            "se_contact_fraction": se_fraction,
-            "void_contact_fraction": void_fraction,
+            "surface_fraction": surface_fraction,
+            "se_state": se_state,
             "void_state": void_state,
+            "other_fraction": other_fraction,
         },
         spacing_um,
     )
@@ -270,110 +326,11 @@ def make_state_surfaces(
     surface = as_smooth_surface(surface)
     void_surface = surface.threshold(value=void_state_threshold, scalars="void_state", method="upper")
     void_surface = as_smooth_surface(void_surface)
-    other_surface = surface.threshold(value=0.01, scalars="se_contact_fraction", method="lower")
+    se_surface = surface.threshold(value=0.50, scalars="se_state", method="upper")
+    se_surface = as_smooth_surface(se_surface)
+    other_surface = surface.threshold(value=0.01, scalars="other_fraction", method="upper")
     other_surface = as_smooth_surface(other_surface)
-    return {"se": surface, "void": void_surface, "other": other_surface}, bounds
-
-
-def append_faces(
-    face_bins: dict[str, list[np.ndarray]],
-    state: str,
-    fixed_axis: int,
-    fixed_coord: np.ndarray,
-    u_axis: int,
-    u0: np.ndarray,
-    v_axis: int,
-    v0: np.ndarray,
-) -> None:
-    n_faces = fixed_coord.size
-    if n_faces == 0:
-        return
-    points = np.zeros((n_faces, 4, 3), dtype=np.float32)
-    points[:, :, fixed_axis] = fixed_coord[:, None]
-    points[:, 0, u_axis] = u0
-    points[:, 1, u_axis] = u0 + 1
-    points[:, 2, u_axis] = u0 + 1
-    points[:, 3, u_axis] = u0
-    points[:, 0, v_axis] = v0
-    points[:, 1, v_axis] = v0
-    points[:, 2, v_axis] = v0 + 1
-    points[:, 3, v_axis] = v0 + 1
-    face_bins[state].append(points)
-
-
-def collect_axis_faces(label_xyz: np.ndarray, axis: int, positive: bool, face_bins: dict[str, list[np.ndarray]]) -> None:
-    am_slices = [slice(None)] * 3
-    nb_slices = [slice(None)] * 3
-    if positive:
-        am_slices[axis] = slice(None, -1)
-        nb_slices[axis] = slice(1, None)
-        face_offset = 1
-    else:
-        am_slices[axis] = slice(1, None)
-        nb_slices[axis] = slice(None, -1)
-        face_offset = 0
-    am = label_xyz[tuple(am_slices)] == CAM_LABEL
-    neighbor = label_xyz[tuple(nb_slices)]
-    surface = am & (neighbor != CAM_LABEL)
-    if not np.any(surface):
-        return
-
-    coords = np.indices(surface.shape, dtype=np.int32)
-    for neighbor_label in (SE_LABEL, VOID_LABEL, 0):
-        if neighbor_label == 0:
-            mask = surface & ~np.isin(neighbor, (SE_LABEL, VOID_LABEL))
-        else:
-            mask = surface & (neighbor == neighbor_label)
-        if not np.any(mask):
-            continue
-        idx = [coords[dim][mask] for dim in range(3)]
-        if not positive:
-            idx[axis] = idx[axis] + 1
-        fixed_coord = idx[axis] + face_offset
-        other_axes = [dim for dim in range(3) if dim != axis]
-        state = state_name(neighbor_label)
-        append_faces(
-            face_bins,
-            state,
-            axis,
-            fixed_coord.astype(np.float32, copy=False),
-            other_axes[0],
-            idx[other_axes[0]].astype(np.float32, copy=False),
-            other_axes[1],
-            idx[other_axes[1]].astype(np.float32, copy=False),
-        )
-
-
-def subsample_points(points: np.ndarray, max_faces: int, seed: int) -> np.ndarray:
-    if max_faces <= 0 or points.shape[0] <= max_faces:
-        return points
-    rng = np.random.default_rng(seed)
-    keep = np.sort(rng.choice(points.shape[0], size=max_faces, replace=False))
-    return points[keep]
-
-
-def make_polydata(pv, point_blocks: list[np.ndarray], spacing_um: float, max_faces: int, seed: int):
-    if not point_blocks:
-        return None
-    points_by_face = np.concatenate(point_blocks, axis=0)
-    points_by_face = subsample_points(points_by_face, max_faces, seed)
-    n_faces = points_by_face.shape[0]
-    points = (points_by_face.reshape(-1, 3) * spacing_um).astype(np.float32, copy=False)
-    faces = np.empty((n_faces, 5), dtype=np.int64)
-    faces[:, 0] = 4
-    faces[:, 1:] = np.arange(n_faces * 4, dtype=np.int64).reshape(n_faces, 4)
-    return pv.PolyData(points, faces.ravel())
-
-
-def make_state_meshes(pv, label_xyz: np.ndarray, spacing_um: float, max_faces: int) -> dict[str, object]:
-    face_bins: dict[str, list[np.ndarray]] = {"se": [], "void": [], "other": []}
-    for axis in range(3):
-        collect_axis_faces(label_xyz, axis, True, face_bins)
-        collect_axis_faces(label_xyz, axis, False, face_bins)
-    return {
-        state: make_polydata(pv, blocks, spacing_um, max_faces, seed=i + 17)
-        for i, (state, blocks) in enumerate(face_bins.items())
-    }
+    return {"base": surface, "se": se_surface, "void": void_surface, "other": other_surface}, bounds
 
 
 def outline_bounds(label_shape: tuple[int, int, int], spacing_um: float) -> tuple[float, float, float, float, float, float]:
@@ -426,11 +383,13 @@ def add_contact_state_panel(
     meshes: dict[str, object],
     bounds: tuple[float, float, float, float, float, float],
     metrics: dict[str, float],
+    base_opacity: float,
     se_opacity: float,
     void_opacity: float,
     other_opacity: float,
 ) -> None:
     order = (
+        ("base", base_opacity),
         ("other", other_opacity),
         ("se", se_opacity),
         ("void", void_opacity),
@@ -446,16 +405,15 @@ def add_contact_state_panel(
             show_scalar_bar=False,
             smooth_shading=False,
             lighting=True,
-            ambient=0.20,
-            diffuse=0.82,
-            specular=0.08,
+            ambient=0.46 if state == "void" else 0.30,
+            diffuse=0.72,
+            specular=0.04,
         )
     outline = pv.Box(bounds=bounds).outline()
     plotter.add_mesh(outline, color="black", line_width=0.9)
     plotter.add_axes(line_width=1, labels_off=False)
     title = (
-        f"{sample}\n"
-        f"SE-covered AM surface {metrics['se_fraction']:.1%}\n"
+        f"{SAMPLE_TITLES.get(sample, sample)}\n"
         f"Void-exposed AM surface {metrics['void_fraction']:.1%}"
     )
     plotter.add_text(title, position=(0.03, 0.88), font_size=10, viewport=True, color="#222222")
@@ -464,9 +422,8 @@ def add_contact_state_panel(
 
 def add_legend(plotter) -> None:
     lines = (
-        ("SE-rich contact", "se"),
-        ("Void/carbon contact", "void"),
-        ("Other / cut", "other"),
+        ("AM surface", "base"),
+        ("Void/carbon-exposed AM", "void"),
     )
     y = 0.18
     for label, state in lines:
@@ -483,6 +440,12 @@ def write_metrics(rows: list[dict], out_path: Path) -> None:
     print(f"Saved {out_path}")
 
 
+def render_mode_token(args: argparse.Namespace) -> str:
+    if args.contact_mode == "majority":
+        return f"majority_r{args.contact_radius}"
+    return "face1"
+
+
 def main() -> None:
     args = parse_args()
     pv = require_pyvista()
@@ -496,22 +459,36 @@ def main() -> None:
     metric_rows = []
     for sample in SAMPLES:
         label_xyz = load_label_xyz(args, sample)
-        counts = face_state_counts(label_xyz)
-        contact_total = counts["se"] + counts["void"]
+        face_counts = face_state_counts(label_xyz)
+        majority_masks = majority_contact_masks(label_xyz, args.contact_radius)
+        majority_counts = {key: int(np.count_nonzero(mask)) for key, mask in majority_masks.items()}
+        metric_rows.append(counts_to_metric_row(args.dataset, sample, "face1", face_counts, "voxel_face"))
         metric_rows.append(
-            {
-                "dataset": args.dataset,
-                "sample": sample,
-                "am_se_face_count": counts["se"],
-                "am_void_face_count": counts["void"],
-                "am_other_face_count": counts["other"],
-                "am_se_fraction_of_classified_contact": counts["se"] / contact_total if contact_total else np.nan,
-                "am_void_fraction_of_classified_contact": counts["void"] / contact_total if contact_total else np.nan,
-            }
+            counts_to_metric_row(
+                args.dataset,
+                sample,
+                f"majority_r{args.contact_radius}",
+                majority_counts,
+                "surface_voxel",
+                args.contact_radius,
+            )
+        )
+        contact_masks = majority_masks if args.contact_mode == "majority" else face_contact_masks(label_xyz)
+        render_counts = majority_counts if args.contact_mode == "majority" else {
+            key: int(np.count_nonzero(mask)) for key, mask in contact_masks.items()
+        }
+        render_row = counts_to_metric_row(
+            args.dataset,
+            sample,
+            args.contact_mode,
+            render_counts,
+            "surface_voxel",
+            args.contact_radius if args.contact_mode == "majority" else None,
         )
         meshes, bounds = make_state_surfaces(
             pv,
             label_xyz,
+            contact_masks,
             int(factor),
             spacing_um,
             args.surface_threshold,
@@ -522,8 +499,8 @@ def main() -> None:
             "meshes": meshes,
             "bounds": bounds,
             "metrics": {
-                "se_fraction": metric_rows[-1]["am_se_fraction_of_classified_contact"],
-                "void_fraction": metric_rows[-1]["am_void_fraction_of_classified_contact"],
+                "se_fraction": render_row["am_se_fraction_of_classified_contact"],
+                "void_fraction": render_row["am_void_fraction_of_classified_contact"],
             },
         }
         face_summary = ", ".join(
@@ -544,6 +521,7 @@ def main() -> None:
             render_data[sample]["meshes"],
             render_data[sample]["bounds"],
             render_data[sample]["metrics"],
+            args.base_opacity,
             args.se_opacity,
             args.void_opacity,
             args.other_opacity,
@@ -555,11 +533,12 @@ def main() -> None:
         set_y_up_camera(plotter, first_bounds)
     add_legend(plotter)
 
-    out_path = out_dir / f"{args.dataset}_am_surface_contact_state_3d.png"
+    mode_token = render_mode_token(args)
+    out_path = out_dir / f"{args.dataset}_am_surface_void_exposed_{mode_token}_3d.png"
     plotter.screenshot(str(out_path), transparent_background=True)
     plotter.close()
     print(f"Saved {out_path}")
-    write_metrics(metric_rows, out_dir / f"{args.dataset}_am_surface_contact_state_metrics.csv")
+    write_metrics(metric_rows, out_dir / f"{args.dataset}_am_surface_contact_definition_comparison.csv")
 
 
 if __name__ == "__main__":
