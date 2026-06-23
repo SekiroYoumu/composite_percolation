@@ -10,5 +10,7 @@ server_results/
 archive/
 bulk_fields/
 intermediate/
+/30um-in-plane/
+/runs/
 config_representative_recompute.json
 check.py

@@ -11,6 +11,7 @@ import matplotlib
 matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt
+from matplotlib.colors import PowerNorm
 import numpy as np
 import tifffile as tiff
 
@@ -64,6 +65,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--potential-p-high", type=float, default=99.0)
     parser.add_argument("--flux-p-low", type=float, default=1.0)
     parser.add_argument("--flux-p-high", type=float, default=99.0)
+    parser.add_argument("--clean-only", action="store_true", help="Only save title/axis/colorbar-free 2D maps.")
+    parser.add_argument(
+        "--reference-tail-maps",
+        action="store_true",
+        help="Also save percentile low/high maps using one sample as the reference distribution.",
+    )
+    parser.add_argument("--tail-reference", choices=["merged", "wm", "pfdt"], default="merged")
+    parser.add_argument("--tail-percent", type=float, default=5.0)
+    parser.add_argument(
+        "--reference-gradient-maps",
+        action="store_true",
+        help="Also save nonlinear continuous maps using the same reference high-tail threshold.",
+    )
+    parser.add_argument(
+        "--gradient-gamma",
+        type=float,
+        default=0.48,
+        help="PowerNorm gamma for reference-gradient maps. Values >1 suppress mid values and emphasize extreme bottlenecks.",
+    )
     return parser.parse_args()
 
 
@@ -506,6 +526,77 @@ def save_potential_linear_flux_maps(
         save_figure(fig, path)
         plt.close(fig)
         print(f"Saved {path}")
+        save_potential_linear_flux_maps_clean(
+            entries,
+            out_dir,
+            voxel_um,
+            potential_limits,
+            flux_limits,
+            flux_field,
+            filename_token,
+            plane,
+            potential_cmap,
+            flux_cmap,
+        )
+
+
+def add_scale_bar(ax, length_um: float = 5.0) -> None:
+    x0, x1 = ax.get_xlim()
+    y0, y1 = ax.get_ylim()
+    pad_x = 0.06 * (x1 - x0)
+    pad_y = 0.07 * (y1 - y0)
+    xb = x1 - pad_x - length_um
+    yb = y0 + pad_y
+    ax.plot([xb, xb + length_um], [yb, yb], color="black", lw=1.2, solid_capstyle="butt")
+    ax.text(xb + length_um / 2, yb + 0.45, f"{length_um:g} μm", ha="center", va="bottom", fontsize=9)
+
+
+def save_potential_linear_flux_maps_clean(
+    entries: list[dict],
+    out_dir: Path,
+    voxel_um: float,
+    potential_limits: tuple[float, float],
+    flux_limits: tuple[float, float],
+    flux_field: str,
+    filename_token: str,
+    plane: str,
+    potential_cmap,
+    flux_cmap,
+) -> None:
+    fig, axes = plt.subplots(
+        2,
+        len(entries),
+        figsize=(4.8, 4.8),
+        constrained_layout=False,
+    )
+    fig.subplots_adjust(left=0, right=1, bottom=0, top=1, wspace=0.035, hspace=0.035)
+    if len(entries) == 1:
+        axes = axes[:, None]
+    for col, entry in enumerate(entries):
+        for row, (field, cmap, limits) in enumerate(
+            (
+                ("potential", potential_cmap, potential_limits),
+                (flux_field, flux_cmap, flux_limits),
+            )
+        ):
+            ax = axes[row, col]
+            image = masked_center_slice(entry, field, plane)
+            ax.imshow(
+                image.T,
+                origin="lower",
+                cmap=cmap,
+                interpolation="nearest",
+                vmin=limits[0],
+                vmax=limits[1],
+                extent=image_extent_um(image, plane, voxel_um),
+                aspect="equal",
+            )
+            add_scale_bar(ax, 5.0)
+            ax.set_axis_off()
+    path = out_dir / f"representative30_potential_{filename_token}_linear_comparison_{plane}_clean_scalebar.png"
+    save_figure(fig, path)
+    plt.close(fig)
+    print(f"Saved {path}")
 
 
 def save_low_high_maps(entries: list[dict], out_dir: Path, quantity: str, voxel_um: float,
@@ -553,6 +644,301 @@ def save_low_high_maps(entries: list[dict], out_dir: Path, quantity: str, voxel_
         save_figure(fig, path)
         plt.close(fig)
         print(f"Saved {path}")
+        save_low_high_maps_clean(entries, out_dir, quantity, voxel_um, global_median, plane)
+
+
+def save_low_high_maps_clean(
+    entries: list[dict],
+    out_dir: Path,
+    quantity: str,
+    voxel_um: float,
+    global_median: float,
+    plane: str,
+) -> None:
+    fig, axes = plt.subplots(
+        1,
+        len(entries),
+        figsize=(5.6, 2.8),
+        constrained_layout=False,
+    )
+    fig.subplots_adjust(left=0, right=1, bottom=0, top=1, wspace=0.035, hspace=0)
+    if len(entries) == 1:
+        axes = [axes]
+    for ax, entry in zip(axes, entries):
+        scalar = center_slices_xyz(entry["quantities"][quantity])[plane]
+        se = center_slices_xyz(entry["se_mask"])[plane]
+        image = np.full((*scalar.shape, 4), (0.92, 0.92, 0.92, 1.0), dtype=np.float32)
+        image[se] = (0.64, 0.64, 0.64, 1.0)
+        low = se & (scalar < 0.5 * global_median)
+        high = se & (scalar > 2.0 * global_median)
+        top10_threshold = np.nanpercentile(entry["quantities"][quantity][entry["se_mask"]], 90.0)
+        top10 = se & (scalar > top10_threshold)
+        image[low] = matplotlib.colors.to_rgba("#4575b4", alpha=0.95)
+        image[high] = matplotlib.colors.to_rgba("#f46d43", alpha=0.95)
+        image[top10] = matplotlib.colors.to_rgba("#d73027", alpha=0.95)
+        ax.imshow(
+            image.transpose(1, 0, 2),
+            origin="lower",
+            interpolation="nearest",
+            extent=image_extent_um(scalar, plane, voxel_um),
+            aspect="equal",
+        )
+        add_scale_bar(ax, 5.0)
+        ax.set_axis_off()
+    path = out_dir / f"representative30_{quantity}_low_high_map_{plane}_clean_scalebar.png"
+    save_figure(fig, path)
+    plt.close(fig)
+    print(f"Saved {path}")
+
+
+def median_scaled_quantity(entry: dict, quantity: str) -> tuple[np.ndarray, float]:
+    scalar = entry["quantities"][quantity]
+    values = scalar[np.isfinite(scalar) & entry["se_mask"]]
+    values = values[values > 0]
+    median = float(np.nanmedian(values)) if values.size else 1.0
+    if median <= 0 or not np.isfinite(median):
+        median = 1.0
+    return (scalar / median).astype(np.float32, copy=False), median
+
+
+def reference_tail_thresholds(
+    entries: list[dict], quantity: str, reference: str, tail_percent: float
+) -> tuple[float, float, str]:
+    scaled_values = []
+    reference_upper = reference.upper()
+    for entry in entries:
+        scaled, _ = median_scaled_quantity(entry, quantity)
+        values = scaled[np.isfinite(scaled) & entry["se_mask"]]
+        values = values[values >= 0]
+        if not values.size:
+            continue
+        if reference == "merged" or entry["sample"].upper() == reference_upper:
+            scaled_values.append(values.astype(np.float32, copy=False))
+    if not scaled_values:
+        raise ValueError(f"No reference values found for {reference!r} {quantity}.")
+    reference_values = np.concatenate(scaled_values)
+    low, high = np.nanpercentile(reference_values, [tail_percent, 100.0 - tail_percent])
+    return float(low), float(high), reference_upper if reference != "merged" else "merged"
+
+
+def tail_map_image(scalar: np.ndarray, se: np.ndarray, low_threshold: float, high_threshold: float) -> np.ndarray:
+    image = np.full((*scalar.shape, 4), (0.92, 0.92, 0.92, 1.0), dtype=np.float32)
+    image[se] = (0.66, 0.66, 0.66, 1.0)
+    low = se & (scalar <= low_threshold)
+    high = se & (scalar >= high_threshold)
+    image[low] = matplotlib.colors.to_rgba("#4575b4", alpha=0.95)
+    image[high] = matplotlib.colors.to_rgba("#d73027", alpha=0.95)
+    return image
+
+
+def save_reference_tail_maps(
+    entries: list[dict],
+    out_dir: Path,
+    quantity: str,
+    voxel_um: float,
+    reference: str,
+    tail_percent: float,
+) -> None:
+    quantity_label = QUANTITY_LABELS.get(quantity, quantity)
+    low_threshold, high_threshold, reference_label = reference_tail_thresholds(
+        entries, quantity, reference, tail_percent
+    )
+    token = f"{reference_label.lower()}_ref_tails{tail_percent:g}pct"
+    print(
+        f"{quantity} {reference_label} reference tails: "
+        f"bottom{tail_percent:g}%<={low_threshold:.6g}, top{tail_percent:g}%>={high_threshold:.6g}"
+    )
+    for plane in PLANES:
+        fig, axes = plt.subplots(
+            1,
+            len(entries),
+            figsize=panel_figsize(len(entries), 1, extra_width_mm=24.0),
+            constrained_layout=False,
+        )
+        fig.subplots_adjust(left=0.07, right=0.82, bottom=0.12, top=0.86, wspace=0.28)
+        if len(entries) == 1:
+            axes = [axes]
+        clean_fig, clean_axes = plt.subplots(1, len(entries), figsize=(5.6, 2.8), constrained_layout=False)
+        clean_fig.subplots_adjust(left=0, right=1, bottom=0, top=1, wspace=0.035, hspace=0)
+        if len(entries) == 1:
+            clean_axes = [clean_axes]
+        for ax, clean_ax, entry in zip(axes, clean_axes, entries):
+            scaled, sample_median = median_scaled_quantity(entry, quantity)
+            scalar = center_slices_xyz(scaled)[plane]
+            se = center_slices_xyz(entry["se_mask"])[plane]
+            image = tail_map_image(scalar, se, low_threshold, high_threshold)
+            high_fraction = float(
+                np.count_nonzero((scaled >= high_threshold) & entry["se_mask"]) / np.count_nonzero(entry["se_mask"])
+            )
+            low_fraction = float(
+                np.count_nonzero((scaled <= low_threshold) & entry["se_mask"]) / np.count_nonzero(entry["se_mask"])
+            )
+            for target_ax in (ax, clean_ax):
+                target_ax.imshow(
+                    image.transpose(1, 0, 2),
+                    origin="lower",
+                    interpolation="nearest",
+                    extent=image_extent_um(scalar, plane, voxel_um),
+                    aspect="equal",
+                )
+            axis_h, axis_v = PLANE_AXES[plane]
+            ax.set_xlabel(f"{axis_h} (um)")
+            ax.set_ylabel(f"{axis_v} (um)")
+            ax.set_title(
+                f"{entry['sample']} {PLANE_LABELS[plane]}\n"
+                f"{quantity_label}, {reference_label}-ref tails"
+            )
+            clean_ax.set_axis_off()
+            add_scale_bar(clean_ax, 5.0)
+            print(
+                f"  {entry['sample']} {quantity} {plane}: "
+                f"low={100 * low_fraction:.2f}%, high={100 * high_fraction:.2f}%, "
+                f"median={sample_median:.6g}"
+            )
+        handles = [
+            plt.Line2D([0], [0], color="#4575b4", lw=8, label=f"bottom {tail_percent:g}% {reference_label} ref"),
+            plt.Line2D([0], [0], color=(0.66, 0.66, 0.66), lw=8, label="middle"),
+            plt.Line2D([0], [0], color="#d73027", lw=8, label=f"top {tail_percent:g}% {reference_label} ref"),
+            plt.Line2D([0], [0], color=(0.92, 0.92, 0.92), lw=8, label="non-SE"),
+        ]
+        fig.legend(handles=handles, loc="center left", bbox_to_anchor=(0.84, 0.50), frameon=False)
+        path = out_dir / f"representative30_{quantity}_{token}_map_{plane}.png"
+        style_axes(axes)
+        save_figure(fig, path)
+        plt.close(fig)
+        print(f"Saved {path}")
+        clean_path = out_dir / f"representative30_{quantity}_{token}_map_{plane}_clean_scalebar.png"
+        save_figure(clean_fig, clean_path)
+        plt.close(clean_fig)
+        print(f"Saved {clean_path}")
+
+
+def bottleneck_gradient_cmap():
+    cmap = matplotlib.colors.LinearSegmentedColormap.from_list(
+        "bottleneck_gradient",
+        ["#b4b4b4", "#7f6ea8", "#d6604d", "#fff176"],
+    )
+    cmap.set_bad((0.92, 0.92, 0.92, 1.0))
+    return cmap
+
+
+def save_reference_gradient_maps(
+    entries: list[dict],
+    out_dir: Path,
+    quantity: str,
+    voxel_um: float,
+    reference: str,
+    tail_percent: float,
+    gamma: float,
+) -> None:
+    quantity_label = QUANTITY_LABELS.get(quantity, quantity)
+    _, high_threshold, reference_label = reference_tail_thresholds(entries, quantity, reference, tail_percent)
+    token = f"{reference_label.lower()}_ref_gradient_top{tail_percent:g}pct_gamma{gamma:g}"
+    cmap = bottleneck_gradient_cmap()
+    norm = PowerNorm(gamma=max(float(gamma), 1.0e-3), vmin=0.0, vmax=high_threshold)
+    print(
+        f"{quantity} {reference_label} reference nonlinear gradient: "
+        f"vmax=top{tail_percent:g}% threshold={high_threshold:.6g}, gamma={gamma:g}"
+    )
+
+    for plane in PLANES:
+        fig, axes = plt.subplots(
+            1,
+            len(entries),
+            figsize=panel_figsize(len(entries), 1, extra_width_mm=20.0),
+            constrained_layout=False,
+        )
+        fig.subplots_adjust(left=0.07, right=0.84, bottom=0.12, top=0.86, wspace=0.28)
+        if len(entries) == 1:
+            axes = [axes]
+
+        clean_fig, clean_axes = plt.subplots(1, len(entries), figsize=(5.6, 2.8), constrained_layout=False)
+        clean_fig.subplots_adjust(left=0, right=1, bottom=0, top=1, wspace=0.035, hspace=0)
+        if len(entries) == 1:
+            clean_axes = [clean_axes]
+
+        last_image = None
+        for ax, clean_ax, entry in zip(axes, clean_axes, entries):
+            scaled, sample_median = median_scaled_quantity(entry, quantity)
+            scalar = center_slices_xyz(scaled)[plane]
+            se = center_slices_xyz(entry["se_mask"])[plane]
+            image = np.ma.array(scalar, mask=~se)
+            extent = image_extent_um(scalar, plane, voxel_um)
+            high_fraction = float(
+                np.count_nonzero((scaled >= high_threshold) & entry["se_mask"]) / np.count_nonzero(entry["se_mask"])
+            )
+            last_image = ax.imshow(
+                image.T,
+                origin="lower",
+                interpolation="nearest",
+                cmap=cmap,
+                norm=norm,
+                extent=extent,
+                aspect="equal",
+            )
+            clean_ax.imshow(
+                image.T,
+                origin="lower",
+                interpolation="nearest",
+                cmap=cmap,
+                norm=norm,
+                extent=extent,
+                aspect="equal",
+            )
+            axis_h, axis_v = PLANE_AXES[plane]
+            ax.set_xlabel(f"{axis_h} (um)")
+            ax.set_ylabel(f"{axis_v} (um)")
+            ax.set_title(
+                f"{entry['sample']} {PLANE_LABELS[plane]}\n"
+                f"{quantity_label}/median, {reference_label}-ref nonlinear"
+            )
+            clean_ax.set_axis_off()
+            add_scale_bar(clean_ax, 5.0)
+            print(
+                f"  {entry['sample']} {quantity} {plane}: "
+                f">=ref top{tail_percent:g}%={100 * high_fraction:.2f}%, median={sample_median:.6g}"
+            )
+
+        if last_image is not None:
+            cbar = fig.colorbar(last_image, ax=axes, shrink=0.82, pad=0.025)
+            cbar.set_label(f"{quantity_label} / sample median")
+            style_colorbar(cbar)
+        style_axes(axes)
+        path = out_dir / f"representative30_{quantity}_{token}_map_{plane}.png"
+        save_figure(fig, path)
+        plt.close(fig)
+        print(f"Saved {path}")
+
+        clean_path = out_dir / f"representative30_{quantity}_{token}_map_{plane}_clean_scalebar.png"
+        save_figure(clean_fig, clean_path)
+        plt.close(clean_fig)
+        print(f"Saved {clean_path}")
+
+
+def save_clean_maps_only(
+    entries: list[dict],
+    out_dir: Path,
+    voxel_um: float,
+    potential_limits: tuple[float, float],
+    flux_limits: tuple[float, float],
+    flux_field: str,
+    filename_token: str,
+) -> None:
+    potential_cmap = transparent_cmap("viridis")
+    flux_cmap = transparent_cmap("magma")
+    for plane in PLANES:
+        save_potential_linear_flux_maps_clean(
+            entries,
+            out_dir,
+            voxel_um,
+            potential_limits,
+            flux_limits,
+            flux_field,
+            filename_token,
+            plane,
+            potential_cmap,
+            flux_cmap,
+        )
 
 
 def main() -> None:
@@ -577,17 +963,28 @@ def main() -> None:
         ]
     )
     flux_limits = percentile_limits(flux_values, args.flux_p_low, args.flux_p_high)
-    save_potential_linear_flux_maps(
-        entries,
-        out_dir,
-        args.voxel_size_um,
-        potential_limits,
-        flux_limits,
-        "flux_magnitude",
-        "Flux magnitude",
-        "Flux magnitude",
-        "flux",
-    )
+    if args.clean_only:
+        save_clean_maps_only(
+            entries,
+            out_dir,
+            args.voxel_size_um,
+            potential_limits,
+            flux_limits,
+            "flux_magnitude",
+            "flux",
+        )
+    else:
+        save_potential_linear_flux_maps(
+            entries,
+            out_dir,
+            args.voxel_size_um,
+            potential_limits,
+            flux_limits,
+            "flux_magnitude",
+            "Flux magnitude",
+            "Flux magnitude",
+            "flux",
+        )
 
     abs_jy_key = next((key for key in entries[0]["quantities"] if key.lower() == "abs_jy"), None)
     if abs_jy_key is not None and all(abs_jy_key in entry["quantities"] for entry in entries):
@@ -599,17 +996,28 @@ def main() -> None:
             ]
         )
         jy_limits = percentile_limits(jy_values, args.flux_p_low, args.flux_p_high)
-        save_potential_linear_flux_maps(
-            entries,
-            out_dir,
-            args.voxel_size_um,
-            potential_limits,
-            jy_limits,
-            abs_jy_key,
-            "|Jy|",
-            "|Jy|",
-            "abs_Jy",
-        )
+        if args.clean_only:
+            save_clean_maps_only(
+                entries,
+                out_dir,
+                args.voxel_size_um,
+                potential_limits,
+                jy_limits,
+                abs_jy_key,
+                "abs_Jy",
+            )
+        else:
+            save_potential_linear_flux_maps(
+                entries,
+                out_dir,
+                args.voxel_size_um,
+                potential_limits,
+                jy_limits,
+                abs_jy_key,
+                "|Jy|",
+                "|Jy|",
+                "abs_Jy",
+            )
 
     quantities = sorted(set().union(*(entry["quantities"].keys() for entry in entries)))
     rows = []
@@ -633,9 +1041,35 @@ def main() -> None:
                     entry["meta"],
                 )
             )
-        save_lorenz(entries, out_dir, quantity)
-        save_y_profiles(entries, out_dir, quantity, args.voxel_size_um, args.interior_margin_fraction)
-        save_low_high_maps(entries, out_dir, quantity, args.voxel_size_um, global_median)
+        if args.clean_only:
+            for plane in PLANES:
+                save_low_high_maps_clean(entries, out_dir, quantity, args.voxel_size_um, global_median, plane)
+        else:
+            save_lorenz(entries, out_dir, quantity)
+            save_y_profiles(entries, out_dir, quantity, args.voxel_size_um, args.interior_margin_fraction)
+            save_low_high_maps(entries, out_dir, quantity, args.voxel_size_um, global_median)
+        if args.reference_tail_maps:
+            save_reference_tail_maps(
+                entries,
+                out_dir,
+                quantity,
+                args.voxel_size_um,
+                args.tail_reference,
+                args.tail_percent,
+            )
+        if args.reference_gradient_maps:
+            save_reference_gradient_maps(
+                entries,
+                out_dir,
+                quantity,
+                args.voxel_size_um,
+                args.tail_reference,
+                args.tail_percent,
+                args.gradient_gamma,
+            )
+
+    if args.clean_only:
+        return
 
     save_csv(rows, out_dir)
     save_metric_bars(rows, out_dir)

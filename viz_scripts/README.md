@@ -473,3 +473,37 @@ uniform flux distribution and a larger effectively participating SE network.
 
 中文理解是：WM 不是所有地方都“导得低”，而是 SE 网络分布较差，导致 flux 被
 集中到少数通道中，形成局部瓶颈，整体等效传输能力下降。
+
+## Current redraw entry points
+
+### 30 um scatter summaries without SD error bars
+
+For archived 30 um batch results, redraw scatter summaries as points plus a short mean bar:
+
+```powershell
+python scripts\05_plot_results.py --results-dir server_results\30um-in-plane\results --scatter-only --summary-style mean_only --output-suffix mean_short_no_sd
+```
+
+This keeps the four spatial subvolumes visible and avoids presenting their SD as statistical uncertainty.
+
+### Geometry contact metrics with 2-voxel majority contact
+
+For AM surface contact metrics, use a 2-voxel local majority definition and omit SD error bars:
+
+```powershell
+python viz_scripts\08_analyze_geometry_3d.py --skip-render --majority-contact-radius 2 --metrics-output-suffix no_sd --error-style none
+```
+
+The majority-contact plot is written with an explicit radius in the filename, for example
+`geometry_contact_metrics_summary_majority_r2_no_sd.png`.
+
+### 2D contact-state overlay and local 3D exposure views
+
+To generate the representative 2D slice overlay and 10/15 um local exposure views:
+
+```powershell
+python viz_scripts\10_plot_contact_state_slice_and_local3d.py
+```
+
+The 2D overlay uses AM boundary contact-state colors, while the local 3D views emphasize
+void/carbon-adjacent AM surface in selected representative windows.

@@ -28,6 +28,10 @@ SAMPLE_COLORS = {
     "WM": "#376795",
     "PFDT": "#72bcd5",
 }
+COMBINED_METRIC_GRADIENTS = {
+    "WM": ("#82ACD2", "#689BCA"),
+    "PFDT": ("#F4AFAC", "#EC716A"),
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -47,7 +51,24 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--output-dir", default=PROJECT_ROOT / "viz" / "geometry_3d")
     parser.add_argument("--metrics-dir", default=PROJECT_ROOT / "viz" / "geometry_metrics")
+    parser.add_argument(
+        "--metrics-output-suffix",
+        default="",
+        help="Optional suffix for metrics outputs, e.g. majority_r2, to avoid overwriting existing figures.",
+    )
     parser.add_argument("--voxel-size-um", type=float, default=0.07)
+    parser.add_argument(
+        "--majority-contact-radius",
+        type=int,
+        default=2,
+        help="Voxel radius for AM surface SE/void majority contact-state metrics.",
+    )
+    parser.add_argument(
+        "--error-style",
+        choices=["sd", "faint", "none"],
+        default="sd",
+        help="Error-bar style for spatial subvolume summary plots.",
+    )
     parser.add_argument("--representative-render-downsample", type=int, default=4)
     parser.add_argument("--whole-roi-render-downsample", type=int, default=6)
     parser.add_argument("--representative-connectivity-downsample", type=int, default=2)
@@ -239,6 +260,47 @@ def boundary_face_count(mask: np.ndarray) -> int:
     return count
 
 
+def local_phase_count(mask: np.ndarray, radius: int) -> np.ndarray:
+    if radius <= 0:
+        return mask.astype(np.uint16, copy=False)
+    try:
+        from scipy import ndimage
+
+        kernel = np.ones((2 * radius + 1, 2 * radius + 1, 2 * radius + 1), dtype=np.uint8)
+        return ndimage.convolve(mask.astype(np.uint8, copy=False), kernel, mode="constant", cval=0).astype(
+            np.uint16, copy=False
+        )
+    except ImportError:
+        out = np.zeros(mask.shape, dtype=np.uint16)
+        padded = np.pad(mask.astype(np.uint8, copy=False), radius, mode="constant")
+        for dz in range(2 * radius + 1):
+            for dy in range(2 * radius + 1):
+                for dx in range(2 * radius + 1):
+                    out += padded[
+                        dz : dz + mask.shape[0],
+                        dy : dy + mask.shape[1],
+                        dx : dx + mask.shape[2],
+                    ]
+        return out
+
+
+def majority_contact_counts(label_zyx: np.ndarray, labels: dict[str, int], radius: int) -> dict[str, int]:
+    am = label_zyx == labels["CAM"]
+    surface = am & six_neighbor(~am)
+    se_count = local_phase_count(label_zyx == labels["SE-rich"], radius)
+    void_count = local_phase_count(label_zyx == labels["Void/carbon-rich"], radius)
+    classified = surface & ((se_count + void_count) > 0)
+    void_exposed = classified & (void_count > se_count)
+    se_covered = classified & ~void_exposed
+    other = surface & ~classified
+    return {
+        "surface": int(np.count_nonzero(surface)),
+        "se": int(np.count_nonzero(se_covered)),
+        "void": int(np.count_nonzero(void_exposed)),
+        "other": int(np.count_nonzero(other)),
+    }
+
+
 def largest_component_fraction(mask: np.ndarray) -> float:
     try:
         from scipy import ndimage
@@ -330,6 +392,20 @@ def compute_metrics(
     row["am_void_area_fraction_of_am_surface_plus_boundary"] = safe_ratio(
         row["am_void_area_um2"], row["am_surface_plus_roi_boundary_area_um2"]
     )
+
+    majority_counts = majority_contact_counts(label_zyx, labels, int(args.majority_contact_radius))
+    majority_total = float(majority_counts["se"] + majority_counts["void"])
+    majority_surface = float(majority_counts["surface"])
+    prefix = f"am_surface_majority_r{int(args.majority_contact_radius)}"
+    row[f"{prefix}_contact_radius_voxels"] = int(args.majority_contact_radius)
+    row[f"{prefix}_voxel_count"] = majority_counts["surface"]
+    row[f"{prefix}_se_voxel_count"] = majority_counts["se"]
+    row[f"{prefix}_void_voxel_count"] = majority_counts["void"]
+    row[f"{prefix}_other_voxel_count"] = majority_counts["other"]
+    row[f"{prefix}_se_fraction_of_classified_contact"] = safe_ratio(majority_counts["se"], majority_total)
+    row[f"{prefix}_void_fraction_of_classified_contact"] = safe_ratio(majority_counts["void"], majority_total)
+    row[f"{prefix}_se_fraction_of_am_surface"] = safe_ratio(majority_counts["se"], majority_surface)
+    row[f"{prefix}_void_fraction_of_am_surface"] = safe_ratio(majority_counts["void"], majority_surface)
 
     connectivity_factor = (
         args.representative_connectivity_downsample
@@ -650,7 +726,17 @@ def write_metrics(rows: list[dict], out_path: Path) -> None:
     print(f"Saved {saved_path}")
 
 
-def plot_contact_metric_summary(rows: list[dict], out_path: Path) -> None:
+def error_kwargs_for_style(error_style: str) -> dict:
+    if error_style == "none":
+        return {"show": False, "error_kw": {}}
+    alpha = 0.18 if error_style == "faint" else 1.0
+    return {
+        "show": True,
+        "error_kw": {"elinewidth": 0.9, "capthick": 0.9, "alpha": alpha},
+    }
+
+
+def plot_contact_metric_summary(rows: list[dict], out_path: Path, error_style: str = "sd") -> None:
     apply_publication_style()
     metrics = [
         ("am_se_area_fraction_of_am_internal_surface", "AM-SE / AM surface"),
@@ -662,6 +748,7 @@ def plot_contact_metric_summary(rows: list[dict], out_path: Path) -> None:
     fig, axes = plt.subplots(1, len(metrics), figsize=(7.1, 2.4), constrained_layout=True)
     x = np.arange(len(datasets))
     width = 0.34
+    error_style_kwargs = error_kwargs_for_style(error_style)
     for ax, (key, label) in zip(np.ravel(axes), metrics):
         for offset, sample in [(-width / 2, "WM"), (width / 2, "PFDT")]:
             means = []
@@ -683,11 +770,11 @@ def plot_contact_metric_summary(rows: list[dict], out_path: Path) -> None:
                 x + offset,
                 means,
                 width=width,
-                yerr=errors,
-                capsize=2.5,
+                yerr=errors if error_style_kwargs["show"] else None,
+                capsize=2.5 if error_style_kwargs["show"] else 0,
                 color=SAMPLE_COLORS[sample],
                 label=sample,
-                error_kw={"elinewidth": 0.9, "capthick": 0.9},
+                error_kw=error_style_kwargs["error_kw"],
             )
             for i, values in enumerate(grouped_values):
                 if len(values) <= 1:
@@ -706,8 +793,162 @@ def plot_contact_metric_summary(rows: list[dict], out_path: Path) -> None:
         ax.set_ylabel(label)
         ax.set_ylim(0, 1.05)
         style_axes(ax, minor=False)
-    axes[0].legend(frameon=False, fontsize=9)
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="center left", bbox_to_anchor=(1.01, 0.55), ncol=1, frameon=False)
     save_figure(fig, out_path)
+    print(f"Saved {out_path}")
+
+
+def plot_majority_contact_metric_summary(
+    rows: list[dict], out_path: Path, radius: int, error_style: str = "sd"
+) -> None:
+    apply_publication_style()
+    prefix = f"am_surface_majority_r{int(radius)}"
+    metrics = [
+        (f"{prefix}_se_fraction_of_am_surface", "AM-SE / AM surface"),
+        (f"{prefix}_void_fraction_of_am_surface", "AM-Void / AM surface"),
+        ("se_largest_component_fraction", "SE largest component"),
+    ]
+    datasets = list(dict.fromkeys(row["dataset"] for row in rows))
+    dataset_labels = {"representative30": "30 um", "whole_roi": "whole ROI"}
+    fig, axes = plt.subplots(1, len(metrics), figsize=(7.1, 2.4), constrained_layout=True)
+    x = np.arange(len(datasets))
+    width = 0.34
+    error_style_kwargs = error_kwargs_for_style(error_style)
+    for ax, (key, label) in zip(np.ravel(axes), metrics):
+        for offset, sample in [(-width / 2, "WM"), (width / 2, "PFDT")]:
+            means = []
+            errors = []
+            grouped_values = []
+            for dataset in datasets:
+                values = [
+                    float(row[key])
+                    for row in rows
+                    if row["dataset"] == dataset
+                    and row["sample"] == sample
+                    and key in row
+                    and np.isfinite(float(row[key]))
+                ]
+                grouped_values.append(values)
+                means.append(float(np.mean(values)) if values else float("nan"))
+                errors.append(float(np.std(values, ddof=1)) if len(values) > 1 else 0.0)
+            ax.bar(
+                x + offset,
+                means,
+                width=width,
+                yerr=errors if error_style_kwargs["show"] else None,
+                capsize=2.5 if error_style_kwargs["show"] else 0,
+                color=SAMPLE_COLORS[sample],
+                label=sample,
+                error_kw=error_style_kwargs["error_kw"],
+            )
+            for i, values in enumerate(grouped_values):
+                if len(values) <= 1:
+                    continue
+                jitter = np.linspace(-0.045, 0.045, len(values))
+                ax.scatter(
+                    np.full(len(values), x[i] + offset) + jitter,
+                    values,
+                    s=9,
+                    color="#2f2f2f",
+                    alpha=0.55,
+                    linewidths=0,
+                    zorder=3,
+                )
+        ax.set_xticks(x, [dataset_labels.get(dataset, dataset) for dataset in datasets])
+        ax.set_ylabel(label)
+        ax.set_ylim(0, 1.05)
+        style_axes(ax, minor=False)
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="center left", bbox_to_anchor=(1.01, 0.55), ncol=1, frameon=False)
+    save_figure(fig, out_path)
+    print(f"Saved {out_path}")
+
+
+def hex_to_rgb01(color: str) -> np.ndarray:
+    color = color.lstrip("#")
+    return np.array([int(color[i : i + 2], 16) / 255.0 for i in (0, 2, 4)], dtype=float)
+
+
+def add_gradient_bar(ax, x_center: float, height: float, width: float, bottom_color: str, top_color: str) -> None:
+    left = x_center - width / 2
+    rect = plt.Rectangle((left, 0), width, height, facecolor="none", edgecolor="none")
+    ax.add_patch(rect)
+    bottom = hex_to_rgb01(bottom_color)
+    top = hex_to_rgb01(top_color)
+    gradient = np.linspace(bottom, top, 256).reshape(256, 1, 3)
+    im = ax.imshow(
+        gradient,
+        extent=[left, left + width, 0, height],
+        origin="lower",
+        aspect="auto",
+        interpolation="bicubic",
+        zorder=2,
+    )
+    im.set_clip_path(rect)
+
+
+def plot_representative30_combined_contact_summary(rows: list[dict], out_path: Path, radius: int) -> None:
+    apply_publication_style()
+    prefix = f"am_surface_majority_r{int(radius)}"
+    metrics = [
+        ("void_carbon_volume_fraction", "Apparent\nvoid/C-rich"),
+        (f"{prefix}_se_fraction_of_am_surface", "SE-covered\nAM"),
+        (f"{prefix}_void_fraction_of_am_surface", "Void/C-exposed\nAM"),
+    ]
+    rows = [row for row in rows if row["dataset"] == "representative30"]
+    samples = ["WM", "PFDT"]
+    x = np.arange(len(metrics), dtype=float)
+    width = 0.30
+    offsets = {"WM": -width / 1.85, "PFDT": width / 1.85}
+    fig, ax = plt.subplots(figsize=(66.80 / 25.4, 53.97 / 25.4), constrained_layout=False)
+    fig.subplots_adjust(left=0.17, right=0.98, bottom=0.27, top=0.96)
+    for sample in samples:
+        bottom_color, top_color = COMBINED_METRIC_GRADIENTS[sample]
+        for i, (key, _) in enumerate(metrics):
+            values = np.array(
+                [
+                    float(row[key])
+                    for row in rows
+                    if row["sample"] == sample
+                    and key in row
+                    and np.isfinite(float(row[key]))
+                ],
+                dtype=float,
+            )
+            if values.size == 0:
+                continue
+            xpos = x[i] + offsets[sample]
+            add_gradient_bar(ax, xpos, float(np.mean(values)), width, bottom_color, top_color)
+            jitter = np.linspace(-0.035, 0.035, values.size)
+            ax.scatter(
+                np.full(values.size, xpos) + jitter,
+                values,
+                s=8,
+                color="#303030",
+                alpha=0.72,
+                linewidths=0,
+                zorder=4,
+            )
+    ax.set_xlim(-0.52, len(metrics) - 0.48)
+    ax.set_ylim(0, 1.05)
+    ax.set_xticks(x, [label for _, label in metrics])
+    ax.set_ylabel("Fraction")
+    style_axes(ax, minor=False)
+    ax.tick_params(axis="x", labelsize=8, pad=2)
+    handles = [
+        plt.Rectangle((0, 0), 1, 1, facecolor=COMBINED_METRIC_GRADIENTS["WM"][1], edgecolor="none", label="WM"),
+        plt.Rectangle((0, 0), 1, 1, facecolor=COMBINED_METRIC_GRADIENTS["PFDT"][1], edgecolor="none", label="PFDT"),
+    ]
+    ax.legend(handles=handles, loc="upper left", ncol=2, handlelength=1.1, columnspacing=0.9)
+    fig.savefig(
+        out_path,
+        dpi=600,
+        transparent=True,
+        facecolor="none",
+        edgecolor="none",
+    )
+    plt.close(fig)
     print(f"Saved {out_path}")
 
 
@@ -736,9 +977,32 @@ def main() -> None:
             render_contact_maps(args, pv, dataset, render_data)
 
     metrics_dir = Path(args.metrics_dir)
-    metrics_path = metrics_dir / "geometry_metrics_summary.csv"
+    suffix = str(args.metrics_output_suffix).strip()
+    suffix_token = f"_{suffix}" if suffix else ""
+    metrics_path = metrics_dir / f"geometry_metrics_summary{suffix_token}.csv"
     write_metrics(all_rows, metrics_path)
-    plot_contact_metric_summary(all_rows, metrics_dir / "geometry_contact_metrics_summary.png")
+    legacy_plot_name = (
+        f"geometry_contact_metrics_summary_legacy{suffix_token}.png"
+        if suffix
+        else "geometry_contact_metrics_summary.png"
+    )
+    plot_contact_metric_summary(all_rows, metrics_dir / legacy_plot_name, args.error_style)
+    majority_plot_stem = f"geometry_contact_metrics_summary_majority_r{int(args.majority_contact_radius)}"
+    majority_plot_name = f"{majority_plot_stem}{suffix_token}.png"
+    plot_majority_contact_metric_summary(
+        all_rows,
+        metrics_dir / majority_plot_name,
+        int(args.majority_contact_radius),
+        args.error_style,
+    )
+    combined_plot_name = (
+        f"geometry_contact_metrics_summary_majority_r{int(args.majority_contact_radius)}_30um_combined{suffix_token}.png"
+    )
+    plot_representative30_combined_contact_summary(
+        all_rows,
+        metrics_dir / combined_plot_name,
+        int(args.majority_contact_radius),
+    )
 
 
 if __name__ == "__main__":

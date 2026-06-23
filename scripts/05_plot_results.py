@@ -34,6 +34,17 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Override cfg['results_dir']; useful for redrawing archived result folders.",
     )
+    parser.add_argument(
+        "--summary-style",
+        choices=["mean_sd", "mean_only", "median_only"],
+        default="mean_sd",
+        help="Scatter summary marker style. mean_only/median_only avoid SD error bars for spatial subvolume plots.",
+    )
+    parser.add_argument(
+        "--output-suffix",
+        default="",
+        help="Optional suffix appended to scatter output filenames, e.g. no_sd.",
+    )
     parser.add_argument("--scatter-only", action="store_true", help="Only redraw scatter summary figures.")
     return parser.parse_args()
 
@@ -51,7 +62,29 @@ def read_results(cfg: dict) -> pd.DataFrame:
     return df[np.isfinite(df["keff_norm"])]
 
 
-def scatter_with_mean_sd(df: pd.DataFrame, out: Path) -> None:
+def output_name(base_name: str, suffix: str) -> str:
+    suffix = suffix.strip()
+    if not suffix:
+        return base_name
+    stem, ext = base_name.rsplit(".", 1)
+    return f"{stem}_{suffix}.{ext}"
+
+
+def add_summary_marker(ax, x_pos: float, values: np.ndarray, style: str) -> None:
+    if style == "mean_only":
+        mean = float(np.mean(values))
+        ax.plot([x_pos - 0.10, x_pos + 0.10], [mean, mean], color="black", lw=1.2, solid_capstyle="butt")
+        return
+    if style == "median_only":
+        median = float(np.median(values))
+        ax.plot([x_pos - 0.10, x_pos + 0.10], [median, median], color="black", lw=1.2, solid_capstyle="butt")
+        return
+    mean = float(np.mean(values))
+    sd = float(np.std(values, ddof=1)) if values.size > 1 else 0.0
+    ax.errorbar(x_pos, mean, yerr=sd, fmt="o", ms=4.5, color="black", capsize=3, lw=0.9)
+
+
+def scatter_transport_summary(df: pd.DataFrame, out: Path, summary_style: str = "mean_sd") -> None:
     apply_publication_style()
     samples = list(df["sample"].drop_duplicates())
     fig, ax = plt.subplots(figsize=panel_figsize(panel_width_mm=62.0), constrained_layout=True)
@@ -61,9 +94,7 @@ def scatter_with_mean_sd(df: pd.DataFrame, out: Path) -> None:
         x = np.full(values.size, i, dtype=float) + rng.uniform(-0.08, 0.08, size=values.size)
         color = SAMPLE_COLORS.get(sample, f"C{i - 1}")
         ax.scatter(x, values, s=28, alpha=0.82, color=color, edgecolors="none", label=sample)
-        mean = float(np.mean(values))
-        sd = float(np.std(values, ddof=1)) if values.size > 1 else 0.0
-        ax.errorbar(i, mean, yerr=sd, fmt="o", ms=4.5, color="black", capsize=3, lw=0.9)
+        add_summary_marker(ax, float(i), values, summary_style)
     ax.set_xticks(range(1, len(samples) + 1), samples)
     ax.set_ylabel("Normalized effective ionic\ntransport coefficient")
     ax.set_xlabel("Sample")
@@ -74,7 +105,7 @@ def scatter_with_mean_sd(df: pd.DataFrame, out: Path) -> None:
     plt.close(fig)
 
 
-def phase_fraction_scatter(df: pd.DataFrame, out: Path) -> None:
+def phase_fraction_scatter(df: pd.DataFrame, out: Path, summary_style: str = "mean_sd") -> None:
     apply_publication_style()
     samples = list(df["sample"].drop_duplicates())
     fig, axes = plt.subplots(
@@ -92,9 +123,7 @@ def phase_fraction_scatter(df: pd.DataFrame, out: Path) -> None:
             x = np.full(values.size, i, dtype=float) + rng.uniform(-0.08, 0.08, size=values.size)
             color = SAMPLE_COLORS.get(sample, f"C{i - 1}")
             ax.scatter(x, values, s=24, alpha=0.82, color=color, edgecolors="none")
-            mean = float(np.mean(values))
-            sd = float(np.std(values, ddof=1)) if values.size > 1 else 0.0
-            ax.errorbar(i, mean, yerr=sd, fmt="o", ms=4.2, color="black", capsize=3, lw=0.9)
+            add_summary_marker(ax, float(i), values, summary_style)
         ax.set_title(phase)
         ax.set_xticks(range(1, len(samples) + 1), samples)
         ax.set_xlim(0.55, len(samples) + 0.45)
@@ -214,8 +243,16 @@ def main() -> int:
         cfg["results_dir"] = args.results_dir
     fig_dir = figures_dir(cfg)
     df = read_results(cfg)
-    scatter_with_mean_sd(df, fig_dir / "keff_norm_scatter.png")
-    phase_fraction_scatter(df, fig_dir / "phase_fraction_scatter.png")
+    scatter_transport_summary(
+        df,
+        fig_dir / output_name("keff_norm_scatter.png", args.output_suffix),
+        args.summary_style,
+    )
+    phase_fraction_scatter(
+        df,
+        fig_dir / output_name("phase_fraction_scatter.png", args.output_suffix),
+        args.summary_style,
+    )
     if args.scatter_only:
         print(f"Saved scatter figures in {fig_dir}")
         return 0
